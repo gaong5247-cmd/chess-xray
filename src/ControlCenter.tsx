@@ -2,9 +2,10 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Activity, Check, ChevronRight, Cpu, FolderPlus, Gauge, LayoutGrid,
   Pause, Play, RotateCcw, Settings2, SlidersHorizontal,
-  Swords, Trash2, Trophy, X
+  Swords, Trash2, Trophy, X, BookOpen, FileText, RefreshCcw
 } from 'lucide-react';
 import type { EngineEntry, UciOption } from './engines';
+import type { EpdBook, OpeningMode } from './epd';
 import { createRoundRobin, tournamentTable, type TournamentConfig, type TournamentRun } from './tournament';
 
 export type ControlTab = 'configure' | 'tournament' | 'engines';
@@ -54,6 +55,16 @@ type ControlProps = {
   onOption: (id: string, name: string, value: string) => void;
   onAssign: (id: string, slot: 'white' | 'black') => void;
   tournament: TournamentRun | null;
+  epdBook: EpdBook | null;
+  epdLoading: boolean;
+  epdError: string | null;
+  openingMode: OpeningMode;
+  onOpeningMode: (mode: OpeningMode) => void;
+  pairBookColors: boolean;
+  onPairBookColors: (value: boolean) => void;
+  onChooseEpdBook: () => Promise<void>;
+  onReloadEpdBook: () => Promise<void>;
+  onClearEpdBook: () => void;
   onStartTournament: (config: TournamentConfig) => Promise<void>;
   onPauseTournament: () => Promise<void>;
   onResumeTournament: () => Promise<void>;
@@ -103,7 +114,9 @@ export default function ControlCenter(props: ControlProps) {
     tab, onTab, onClose, layout, onLayout, engines, onAddEngine,
     onRemoveEngine, onRenameEngine, onInspectEngine, inspectingId,
     onOption, onAssign, tournament, onStartTournament,
-    onPauseTournament, onResumeTournament, onStopTournament
+    onPauseTournament, onResumeTournament, onStopTournament,
+    epdBook, epdLoading, epdError, openingMode, onOpeningMode,
+    pairBookColors, onPairBookColors, onChooseEpdBook, onReloadEpdBook, onClearEpdBook
   } = props;
   const [engineId, setEngineId] = useState<string>(engines[0]?.id || '');
   const [selectedEntrants, setSelectedEntrants] = useState<string[]>(() =>
@@ -237,6 +250,46 @@ export default function ControlCenter(props: ControlProps) {
                   <button className="danger-control-button" onClick={() => void onStopTournament()}>End event</button>}
               </div>
             </div>}
+            <div className="opening-book-panel">
+              <div className="opening-book-title">
+                <BookOpen size={19} />
+                <div><b>Opening book</b><span>Random starting positions for every matchup</span></div>
+                <span className="source-pill">{openingMode === 'epd' ? 'RANDOM EPD' : 'STARTPOS'}</span>
+              </div>
+              <div className="opening-book-modes">
+                <label><input type="radio" name="opening-mode" checked={openingMode === 'startpos'}
+                    onChange={() => onOpeningMode('startpos')}/> Standard starting position</label>
+                <label><input type="radio" name="opening-mode" checked={openingMode === 'epd'}
+                    disabled={!epdBook || epdLoading} onChange={() => onOpeningMode('epd')}/>
+                    Random FEN from EPD</label>
+              </div>
+              <div className="opening-book-controls">
+                <button className="plain-control-button" disabled={epdLoading}
+                  onClick={() => void onChooseEpdBook()}><FileText size={15}/>
+                  {epdLoading ? 'Reading book…' : 'Select .epd file'}</button>
+                <button className="plain-control-button" disabled={epdLoading || !epdBook}
+                  onClick={() => void onReloadEpdBook()}><RefreshCcw size={14}/> Resample</button>
+                <button className="plain-control-button" disabled={epdLoading || !epdBook}
+                  onClick={onClearEpdBook}>Clear book</button>
+              </div>
+              {epdBook && <div className="book-loaded">
+                <div className="book-loaded-title"><FileText size={15}/><strong title={epdBook.path}>{epdBook.name}</strong>
+                  <span>READY</span></div>
+                <div className="book-stat-row">
+                  <span><b>{epdBook.candidateLines.toLocaleString()}</b> candidate lines</span>
+                  <span><b>{epdBook.usablePositions.length.toLocaleString()}</b> playable sampled FENs</span>
+                  <span><b>{epdBook.rejectedSamples.toLocaleString()}</b> rejected in sample</span>
+                </div>
+                <p>{epdBook.totalLines.toLocaleString()} lines scanned · at most {epdBook.sampledLines.toLocaleString()} retained in memory (uniform reservoir sample across file)</p>
+                <div className="book-fen-preview" title={epdBook.usablePositions[0]}>Example FEN: {epdBook.usablePositions[0]}</div>
+              </div>}
+              {!epdBook && !epdLoading && <p className="book-hint">Choose a .epd text book containing FEN positions. Invalid or finished positions are excluded from sampled candidates.</p>}
+              {epdError && <p className="book-error" role="alert">{epdError}</p>}
+              <label className="event-check book-pair-check"><input type="checkbox" checked={pairBookColors}
+                onChange={event => onPairBookColors(event.target.checked)}/>
+                Reuse the same FEN in reversed-color pairing (recommended for fairness)</label>
+              <p className="book-note">EPD supports 4-field positions with optional opcodes and full 6-field FEN lines. Each scheduled game receives a frozen opening FEN.</p>
+            </div>
             <div className="tournament-layout">
               <div>
                 <h4>Participants <span>{config.entrants.length} selected</span></h4>
@@ -256,8 +309,8 @@ export default function ControlCenter(props: ControlProps) {
                 </div>
                 <div className="tournament-preview"><Swords size={15}/><strong>{preview.length} scheduled games</strong>
                   <span>Round robin · fixed think time · local Elo estimates</span></div>
-                <button className="affirm-control-button tournament-start" disabled={config.entrants.length < 2 ||
-                  tournament?.status === 'running'} onClick={() => void runNewEvent()}>
+                <button className="affirm-control-button tournament-start" disabled={config.entrants.length < 2 || epdLoading ||
+                  (openingMode === 'epd' && !epdBook) || tournament?.status === 'running'} onClick={() => void runNewEvent()}>
                   <Play size={16}/> Start new tournament
                 </button>
                 {error && <p className="warning">{error}</p>}
@@ -272,12 +325,14 @@ export default function ControlCenter(props: ControlProps) {
                 </tr>)}</tbody></table></div>
               <h4 className="event-table-heading">Game schedule and results</h4>
               <div className="event-table-scroll game-list"><table><thead><tr>
-                <th>#</th><th>Round</th><th>White</th><th>Black</th><th>Result</th></tr></thead>
+                <th>#</th><th>Round</th><th>White</th><th>Black</th><th>Opening FEN</th><th>Result</th></tr></thead>
                 <tbody>{tournament.schedule.map((game,i) => <tr key={game.id}
                   className={i === tournament.index ? 'current-game' : ''}>
                   <td>{game.number}</td><td>{game.round}</td>
                   <td>{engines.find(e => e.id === game.whiteId)?.name || game.whiteId}</td>
                   <td>{engines.find(e => e.id === game.blackId)?.name || game.blackId}</td>
+                  <td><code className="book-schedule-fen" title={game.openingFen || 'Standard start'}>
+                    {game.openingFen ? game.openingFen.split(' ')[0] : 'startpos'}</code></td>
                   <td>{game.outcome || (i === tournament.index && tournament.status === 'running' ? 'LIVE' : '—')}</td>
                 </tr>)}</tbody></table></div>
             </>}

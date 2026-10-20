@@ -420,3 +420,102 @@ button:disabled { cursor: not-allowed; opacity: .42; }
 .control-rail small{display:none}
 .layout-grid,.engine-manager,.tournament-layout{grid-template-columns:1fr}
 }
+
+/* Tournament > Opening book (.epd) */
+.opening-book-panel {
+  margin: 0 0 23px;
+  padding: 19px;
+  border: 1px solid #456a58;
+  background: linear-gradient(135deg, #1b3633, #15283a 85%);
+  border-radius: 11px;
+}
+.opening-book-title {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  margin-bottom: 15px;
+}
+.opening-book-title > svg { color: #c6ee8a; flex: none; }
+.opening-book-title > div { min-width: 0; flex: 1; }
+.opening-book-title b { font-size: 14px; display: block; color: #eaf7e7; }
+.opening-book-title div span { font-size: 10px; display: block; margin-top: 4px; color: #90adbd; }
+.opening-book-modes {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+  border-bottom: 1px solid #35535a;
+  padding-bottom: 14px;
+}
+.opening-book-modes label, .book-pair-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #d5e4ef;
+  cursor: pointer;
+}
+.opening-book-modes input, .book-pair-check input { accent-color: #c7f379; width: 14px; height: 14px; }
+.opening-book-modes input:disabled + span { opacity: .45; }
+.opening-book-controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 15px;
+}
+.opening-book-controls button { font-size: 10px; padding: 8px 11px; }
+.opening-book-controls button:disabled { opacity: .45; }
+.book-loaded {
+  margin: 14px 0 0;
+  padding: 13px;
+  background: #0e2530;
+  border: 1px solid #3e6556;
+  border-radius: 8px;
+}
+.book-loaded-title { display: flex; align-items: center; gap: 7px; }
+.book-loaded-title svg { flex: none; color: #c7f379; }
+.book-loaded-title strong { flex: 1; color: #e4f5e9; font-size: 12px; overflow-wrap: anywhere; }
+.book-loaded-title>span {
+  flex: none;
+  font-size: 9px;
+  color: #baf29f;
+  font-weight: 800;
+  border: 1px solid #52734e;
+  background: #315138;
+  padding: 5px 7px;
+  border-radius: 5px;
+}
+.book-stat-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+.book-stat-row span { font-size: 10px; color: #99b4c7; }
+.book-stat-row span b { color: #d9f8b3; }
+.book-loaded p, .book-note, .book-hint {
+  font-size: 10px;
+  line-height: 1.6;
+  color: #98b0c0;
+  margin: 10px 0;
+}
+.book-fen-preview {
+  margin-top: 11px;
+  font: 10px/1.65 Consolas, "Courier New", monospace;
+  padding: 9px;
+  color: #c7dbde;
+  background: #0b1d2c;
+  border: 1px solid #304b53;
+  border-radius: 5px;
+  word-break: break-word;
+}
+.book-error { color: #ffc3aa; font-size: 11px; line-height: 1.5; font-weight: 700; }
+.book-pair-check { margin-top: 14px; }
+.book-note { margin: 8px 0 0; }
+.book-schedule-fen {
+  font-size: 9px;
+  display: inline-block;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+  color: #bdebd2;
+}

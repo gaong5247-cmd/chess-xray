@@ -143,12 +143,141 @@ fn stop_impl(state: &EngineState, slot: &str) -> Result<(), String> {
 fn stop_engine(slot: String, state: tauri::State<'_, EngineState>) -> Result<(), String> {
     stop_impl(&state, &slot)
 }
+
+// Tournament opening books are read sequentially, so large multi-million-FEN
+// .epd files never have to be loaded into the webview or native process memory.
+const MAX_EPD_RESERVOIR: usize = 4096;
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EpdBookSample {
+    path: String,
+    file_name: String,
+    total_lines: u64,
+    candidate_lines: u64,
+    positions: Vec<String>,
+}
+
+fn parse_epd_fen(line: &str) -> Option<String> {
+    let line = line.trim_start_matches('\u{feff}').trim();
+    if line.is_empty() || line.starts_with('#') || line.starts_with('%') || line.starts_with("//") {
+        return None;
+    }
+    let fields: Vec<&str> = line.split_whitespace().take(6).collect();
+    if fields.len() < 4 {
+        return None;
+    }
+    let board = fields[0];
+    let ranks: Vec<&str> = board.split('/').collect();
+    if ranks.len() != 8 {
+        return None;
+    }
+    for rank in ranks {
+        let mut squares = 0usize;
+        for c in rank.chars() {
+            match c {
+                '1'..='8' => squares += c.to_digit(10)? as usize,
+                'p' | 'r' | 'n' | 'b' | 'q' | 'k' |
+                'P' | 'R' | 'N' | 'B' | 'Q' | 'K' => squares += 1,
+                _ => return None,
+            }
+        }
+        if squares != 8 {
+            return None;
+        }
+    }
+    let side = fields[1];
+    if side != "w" && side != "b" {
+        return None;
+    }
+    let castling = fields[2];
+    if castling != "-" && (castling.len() > 4 || castling.is_empty()
+        || !castling.chars().all(|c| "KQkq".contains(c))) {
+        return None;
+    }
+    let ep = fields[3];
+    if ep != "-" {
+        let bytes = ep.as_bytes();
+        if bytes.len() != 2 || !(b'a'..=b'h').contains(&bytes[0])
+            || bytes[1] != (if side == "w" { b'6' } else { b'3' }) {
+            return None;
+        }
+    }
+    // EPD is four FEN fields followed by optional opcodes; 6-field FEN is
+    // also accepted when the next two fields are numeric move counters.
+    let halfmove = fields.get(4).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let fullmove = fields.get(5).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1);
+    Some(format!("{board} {side} {castling} {ep} {halfmove} {fullmove}"))
+}
+
+#[tauri::command]
+fn load_epd_book(path: String) -> Result<EpdBookSample, String> {
+    use rand::Rng;
+
+    let book_path = PathBuf::from(&path);
+    if !book_path.is_absolute() || !book_path.is_file() {
+        return Err("Choose an existing absolute .epd file path".into());
+    }
+    if !book_path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("epd")) {
+        return Err("Only .epd opening book files are supported".into());
+    }
+    let file = std::fs::File::open(&book_path)
+        .map_err(|e| format!("Unable to open EPD book: {e}"))?;
+    let mut sampler = rand::thread_rng();
+    let mut total_lines = 0u64;
+    let mut candidate_lines = 0u64;
+    let mut positions = Vec::with_capacity(MAX_EPD_RESERVOIR);
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|e| format!("Error while reading EPD book: {e}"))?;
+        total_lines += 1;
+        if line.len() > 4096 {
+            continue;
+        }
+        if let Some(fen) = parse_epd_fen(&line) {
+            candidate_lines += 1;
+            if positions.len() < MAX_EPD_RESERVOIR {
+                positions.push(fen);
+            } else {
+                // Uniform reservoir across the entire file, not just its first lines.
+                let pick = sampler.gen_range(0..candidate_lines);
+                if pick < MAX_EPD_RESERVOIR as u64 {
+                    positions[pick as usize] = fen;
+                }
+            }
+        }
+    }
+    Ok(EpdBookSample {
+        file_name: book_path.file_name().and_then(|name| name.to_str()).unwrap_or("opening.epd").to_string(),
+        path, total_lines, candidate_lines, positions,
+    })
+}
+
+#[cfg(test)]
+mod epd_tests {
+    use super::parse_epd_fen;
+    #[test]
+    fn standard_epd_ignores_opcode_suffix() {
+        assert_eq!(
+            parse_epd_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - bm e4; id \"start\";"),
+            Some("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".into())
+        );
+    }
+    #[test]
+    fn fen_six_fields_and_invalid_epd() {
+        assert_eq!(
+            parse_epd_fen("8/8/8/8/8/8/4k3/4K3 b - - 10 23"),
+            Some("8/8/8/8/8/8/4k3/4K3 b - - 10 23".into())
+        );
+        assert!(parse_epd_fen("8/8/8 w - -").is_none());
+        assert!(parse_epd_fen("# comment").is_none());
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(EngineState::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            bundled_engine_available, launch_engine, send_uci, stop_engine
+            bundled_engine_available, launch_engine, send_uci, stop_engine, load_epd_book
         ])
         .run(tauri::generate_context!())
         .expect("failed to start Chess X-Ray");

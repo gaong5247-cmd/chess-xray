@@ -11,6 +11,7 @@ import {
   Trophy, Zap, SlidersHorizontal
 } from 'lucide-react';
 import { ChessBoard, type Arrow, type BoardTheme } from './ChessBoard';
+import { assignOpeningPositions, makeEpdBook, type EpdBook, type EpdBookSample, type OpeningMode } from './epd';
 import Timeline, { type Metric, type Sample } from './Timeline';
 import SearchTree from './SearchTree';
 import ControlCenter, {
@@ -98,6 +99,14 @@ export default function App() {
   const [depth, setDepth] = useState(14);
   const [threads, setThreads] = useState(2);
   const [hash, setHash] = useState(128);
+  const [epdBook, setEpdBook] = useState<EpdBook | null>(null);
+  const [epdLoading, setEpdLoading] = useState(false);
+  const [epdError, setEpdError] = useState<string | null>(null);
+  const bookRequest = useRef(0);
+  const [openingMode, setOpeningMode] = useState<OpeningMode>(() =>
+    localStorage.getItem('chess-xray-opening-mode') === 'epd' ? 'epd' : 'startpos');
+  const [pairBookColors, setPairBookColors] = useState(() =>
+    localStorage.getItem('chess-xray-paired-epd') !== 'false');
   const [controlTab, setControlTab] = useState<ControlTab | null>(null);
   const [layout, setLayout] = useState<LayoutPrefs>(loadLayout);
   const [engines, setEngines] = useState<EngineEntry[]>(loadEngines);
@@ -117,6 +126,65 @@ export default function App() {
     saveEngines(engines);
   }, [engines]);
   useEffect(() => { persistLayout(layout); }, [layout]);
+  useEffect(() => {
+    localStorage.setItem('chess-xray-opening-mode', openingMode);
+  }, [openingMode]);
+  useEffect(() => {
+    localStorage.setItem('chess-xray-paired-epd', String(pairBookColors));
+  }, [pairBookColors]);
+
+  const loadBookFromPath = useCallback(async (path: string, enableEpd: boolean): Promise<void> => {
+    const request = ++bookRequest.current;
+    setEpdLoading(true);
+    setEpdError(null);
+    try {
+      const scanned = await invoke<EpdBookSample>('load_epd_book', { path });
+      const loaded = makeEpdBook(scanned);
+      if (request !== bookRequest.current) return;
+      setEpdBook(loaded);
+      localStorage.setItem('chess-xray-epd-path', path);
+      if (enableEpd) setOpeningMode('epd');
+      setNotice('EPD BOOK LOADED · ' + loaded.name + ' · ' + loaded.usablePositions.length +
+        ' playable FENs sampled from ' + loaded.candidateLines + ' candidate lines.');
+    } catch (error) {
+      if (request !== bookRequest.current) return;
+      const message = String(error);
+      setEpdBook(null);
+      setEpdError(message);
+      setNotice('EPD BOOK ERROR · ' + message);
+    } finally {
+      if (request === bookRequest.current) setEpdLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const saved = localStorage.getItem('chess-xray-epd-path');
+    if (saved) void loadBookFromPath(saved, false);
+  }, [loadBookFromPath]);
+
+  const chooseEpdBook = async (): Promise<void> => {
+    try {
+      const path = await open({
+        multiple: false, directory: false,
+        filters: [{ name: 'EPD opening positions', extensions: ['epd'] }]
+      });
+      if (typeof path === 'string') await loadBookFromPath(path, true);
+    } catch (error) {
+      setEpdError(String(error));
+    }
+  };
+  const reloadEpdBook = async (): Promise<void> => {
+    if (epdBook) await loadBookFromPath(epdBook.path, false);
+  };
+  const clearEpdBook = () => {
+    bookRequest.current++;
+    setEpdLoading(false);
+    setEpdBook(null);
+    setEpdError(null);
+    setOpeningMode('startpos');
+    localStorage.removeItem('chess-xray-epd-path');
+    setNotice('EPD BOOK CLEARED · Tournament games will use the standard starting position.');
+  };
 
   const send = useCallback(async (slot: Slot, command: string) => {
     try {
@@ -401,9 +469,10 @@ export default function App() {
     await stopEngines();
     if (tournamentRef.current?.status !== 'running') return;
     if (!resume) {
-      chess.current = new Chess();
-      setFen(START);
-      setFenInput(START);
+      const opening = pairing.openingFen || START;
+      chess.current = new Chess(opening);
+      setFen(chess.current.fen());
+      setFenInput(chess.current.fen());
       setMoveSan([]);
       setLastMove(null);
     }
@@ -421,7 +490,9 @@ export default function App() {
     liveRef.current = true;
     setLive(true);
     setNotice('TOURNAMENT LIVE · Game ' + pairing.number + '/' + current.schedule.length
-      + ' · ' + whiteEntry.name + ' vs ' + blackEntry.name + (resume ? ' (resumed)' : ''));
+      + ' · ' + whiteEntry.name + ' vs ' + blackEntry.name
+      + (pairing.openingFen ? ' · EPD book position' : ' · Standard start')
+      + (resume ? ' (resumed)' : ''));
     try {
       await Promise.all(slots.map(slot => invoke('launch_engine', {
         slot, path: selectedPaths[slot]
@@ -444,14 +515,22 @@ export default function App() {
     if (unique.some(id => !enginesRef.current.some(engine => engine.id === id))) {
       throw new Error('Every tournament participant must exist in the Engines library.');
     }
-    const schedule = createRoundRobin({ ...settings, entrants: unique });
+    if (epdLoading) throw new Error('Finish loading the EPD book before starting the tournament.');
+    if (openingMode === 'epd' && !epdBook) {
+      throw new Error('Choose a valid EPD opening book first.');
+    }
+    const planned = createRoundRobin({ ...settings, entrants: unique });
+    const schedule = openingMode === 'epd' && epdBook
+      ? assignOpeningPositions(planned, epdBook.usablePositions, pairBookColors)
+      : planned;
     if (!schedule.length) throw new Error('Could not generate a tournament schedule.');
     await stopEngines();
     const run: TournamentRun = {
       id: 'event-' + Date.now(), name: 'Chess X-Ray Round Robin',
       entries: unique, schedule, index: 0, status: 'running',
       movetime: clamp(settings.movetime, 100, 60000),
-      maxPlies: clamp(settings.maxPlies, 40, 600)
+      maxPlies: clamp(settings.maxPlies, 40, 600),
+      openingBookName: openingMode === 'epd' ? epdBook?.name : undefined
     };
     tournamentRef.current = run;
     setTournament(run);
@@ -772,7 +851,8 @@ export default function App() {
             value={layout.boardSize} onChange={event => setLayout(prev => ({ ...prev, boardSize: Number(event.target.value) }))}/>
           <output>{layout.boardSize}px</output>
           {mode === 'tournament' && tournament && <span className="broadcast-round">
-            GAME {Math.min(tournament.index + 1, tournament.schedule.length)} / {tournament.schedule.length}</span>}
+            GAME {Math.min(tournament.index + 1, tournament.schedule.length)} / {tournament.schedule.length}
+            {' · '}{tournament.openingBookName ? 'EPD: ' + tournament.openingBookName : 'STARTPOS'}</span>}
         </div>
         <div className="board-and-insight">
           <div className="board-cluster">
@@ -894,7 +974,12 @@ export default function App() {
       onAddEngine={addEngine} onRemoveEngine={removeEngine} onRenameEngine={renameEngine}
       onInspectEngine={inspectEngine} inspectingId={inspectingId}
       onOption={editEngineOption} onAssign={assignEngine}
-      tournament={tournament} onStartTournament={startTournament}
+      tournament={tournament}
+      epdBook={epdBook} epdLoading={epdLoading} epdError={epdError}
+      openingMode={openingMode} onOpeningMode={setOpeningMode}
+      pairBookColors={pairBookColors} onPairBookColors={setPairBookColors}
+      onChooseEpdBook={chooseEpdBook} onReloadEpdBook={reloadEpdBook}
+      onClearEpdBook={clearEpdBook} onStartTournament={startTournament}
       onPauseTournament={pauseTournament} onResumeTournament={resumeTournament}
       onStopTournament={stopTournament} />}
     <footer className="statusbar"><span><i className={'status-dot' + (live ? ' active' : '')} />{notice}</span>

@@ -34,3 +34,9 @@ Requires Node.js 22+, Rust stable, Microsoft C++ Build Tools, WebView2.
 Windows GitHub Actions builds NSIS and MSI and publishes a release when the main branch updates.
 
 License: GPL-3.0-or-later. Lichess Cburnett chess pieces GPL-2.0-or-later. Third-party notices are in THIRD_PARTY_NOTICES.md. Not affiliated with Stockfish, Lichess, TCEC, CCC or CCRL.
+
+## Opening books (.epd)
+
+In **Tournament** choose **Select .epd file**, then **Random FEN from EPD** to start every game from a random sampled position. Return games with swapped colors use the same FEN by default; this can be toggled off. The app streams multi-million-line books into a bounded 4,096-position reservoir and checks selected sample candidates with chess.js, with no file upload.
+
+Detailed usage: [EPD opening books](docs/EPD_BOOKS.md) · [Demo positions](examples/demo-openings.epd).

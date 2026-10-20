@@ -11,6 +11,10 @@ export interface TournamentGame {
   outcome?: GameOutcome;
   termination?: string;
   pgn?: string;
+  /** Same key is used by both color legs of a round-robin encounter. */
+  openingPairKey?: string;
+  /** Frozen, randomly sampled starting position for this game. */
+  openingFen?: string;
 }
 export interface TournamentRun {
   id: string;
@@ -21,6 +25,8 @@ export interface TournamentRun {
   status: TournamentStatus;
   movetime: number;
   maxPlies: number;
+  /** Name of the EPD book fixed when this event began; empty for startpos. */
+  openingBookName?: string;
 }
 export interface TournamentConfig {
   entrants: string[];
@@ -51,19 +57,21 @@ export function createRoundRobin(config: TournamentConfig): TournamentGame[] {
   const games: TournamentGame[] = [];
   for (let cycle = 0; cycle < cycles; cycle++) {
     const roundOffset = cycle * roundsPerLeg * (config.doubleRound ? 2 : 1);
-    for (const game of oneLeg) {
+    for (const [pairIndex, game] of oneLeg.entries()) {
       games.push({
         id: 'g-' + (games.length + 1),
         number: games.length + 1, round: roundOffset + game.round,
-        whiteId: game.whiteId, blackId: game.blackId
+        whiteId: game.whiteId, blackId: game.blackId,
+        openingPairKey: cycle + ':' + pairIndex
       });
     }
     if (config.doubleRound) {
-      for (const game of oneLeg) {
+      for (const [pairIndex, game] of oneLeg.entries()) {
         games.push({
           id: 'g-' + (games.length + 1),
           number: games.length + 1, round: roundOffset + roundsPerLeg + game.round,
-          whiteId: game.blackId, blackId: game.whiteId
+          whiteId: game.blackId, blackId: game.whiteId,
+          openingPairKey: cycle + ':' + pairIndex
         });
       }
     }

@@ -1,6 +1,6 @@
 [package]
 name = "chess-xray"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Native UCI engine observatory"
@@ -17,3 +17,5 @@ tauri-build = { version = "2" }
 tauri = { version = "2" }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
+
+rand = "0.8"
