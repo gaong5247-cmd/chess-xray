@@ -8,12 +8,17 @@ import {
   Activity, ArrowLeftRight, BarChart3, ChevronRight, CircleHelp, ClipboardCopy,
   Cpu, Download, Eye, FileInput, FolderOpen, Gauge, GitBranch, HardDrive,
   Layers3, Pause, Play, Radio, RotateCcw, Settings2, ShieldCheck, Swords,
-  Trophy, Zap, SlidersHorizontal
+  Trophy, Zap, SlidersHorizontal, X
 } from 'lucide-react';
 import { ChessBoard, type Arrow, type BoardTheme } from './ChessBoard';
 import { assignOpeningPositions, makeEpdBook, type EpdBook, type EpdBookSample, type OpeningMode } from './epd';
 import Timeline, { type Metric, type Sample } from './Timeline';
 import SearchTree from './SearchTree';
+import PvBoards, { type PvBoardGroupProps } from './PvBoards';
+import {
+  DEFAULT_TIME_CONTROL, buildGoCommand, formatClock, needsManualStop,
+  newGameClocks, sanitizeTimeControl, timeSpent, type ClockTimes, type TimeControl
+} from './timeControls';
 import ControlCenter, {
   type ControlTab, loadLayout, persistLayout, clamp, type LayoutPrefs
 } from './ControlCenter';
@@ -83,6 +88,9 @@ export default function App() {
   const [available, setAvailable] = useState(true);
   const [infos, setInfos] = useState<SlotMap<UciInfo | undefined>>(baseInfo);
   const [pvs, setPvs] = useState<SlotMap<UciInfo[]>>({ white: [], black: [] });
+  const [pvOrigins, setPvOrigins] = useState<SlotMap<string>>({ white: START, black: START });
+  const pvOriginsRef = useRef<SlotMap<string>>({ white: START, black: START });
+  const analysisStarted = useRef<SlotMap<boolean>>({ white: false, black: false });
   const [telemetry, setTelemetry] = useState<SlotMap<XrayTelemetry | null>>({ white: null, black: null });
   const [samples, setSamples] = useState<Sample[]>([]);
   const lastSample = useRef<SlotMap<number>>({ white: 0, black: 0 });
@@ -92,6 +100,7 @@ export default function App() {
   const [notice, setNotice] = useState('READY · Select ANALYZE to connect the bundled Stockfish 19 engine.');
   const [arrowMode, setArrowMode] = useState<ArrowMode>('best');
   const [selectedSlot, setSelectedSlot] = useState<Slot>('white');
+  const [pvFocused, setPvFocused] = useState(false);
   const [flipped, setFlipped] = useState(false);
   const [boardTheme, setBoardTheme] = useState<BoardTheme>('broadcast');
   const [metric, setMetric] = useState<Metric>('eval');
@@ -117,6 +126,10 @@ export default function App() {
   const [tournament, setTournament] = useState<TournamentRun | null>(null);
   const tournamentRef = useRef<TournamentRun | null>(null);
   const nextTournamentGameRef = useRef<((resume: boolean) => Promise<void>) | null>(null);
+  const clockRemainingRef = useRef<ClockTimes>(newGameClocks(DEFAULT_TIME_CONTROL));
+  const [clockDisplay, setClockDisplay] = useState<ClockTimes>(newGameClocks(DEFAULT_TIME_CONTROL));
+  const thinkingStartRef = useRef<{ slot: Slot; startedAt: number } | null>(null);
+  const [manualMovePending, setManualMovePending] = useState(false);
   const config = useRef({ multipv, depth, threads, hash });
   useEffect(() => { config.current = { multipv, depth, threads, hash }; }, [multipv, depth, threads, hash]);
   useEffect(() => { pathsRef.current = paths; localStorage.setItem('chess-xray-engine-paths', JSON.stringify(paths)); }, [paths]);
@@ -194,9 +207,18 @@ export default function App() {
     }
   }, []);
 
+  const setSearchOrigin = useCallback((slot: Slot, position: string) => {
+    const next = { ...pvOriginsRef.current, [slot]: position };
+    pvOriginsRef.current = next;
+    setPvOrigins(next);
+  }, []);
+
   const stopEngines = useCallback(async () => {
     liveRef.current = false;
     searching.current = null;
+    thinkingStartRef.current = null;
+    setManualMovePending(false);
+    analysisStarted.current = { white: false, black: false };
     setLive(false);
     readyRef.current = { white: false, black: false };
     setReady({ white: false, black: false });
@@ -206,23 +228,38 @@ export default function App() {
   }, []);
 
   const searchAnalysis = useCallback(async () => {
-    if (!liveRef.current || modeRef.current !== 'analysis' || !readyRef.current.white) return;
-    await send('white', 'stop');
-    await send('white', 'position fen ' + chess.current.fen());
-    await send('white', 'go infinite');
-  }, [send]);
+    if (!liveRef.current || modeRef.current !== 'analysis') return;
+    const position = chess.current.fen();
+    await Promise.all(slots.filter(slot => readyRef.current[slot]).map(async slot => {
+      if (analysisStarted.current[slot] && pvOriginsRef.current[slot] === position) return;
+      analysisStarted.current[slot] = true;
+      setSearchOrigin(slot, position);
+      setPvs(prev => ({ ...prev, [slot]: [] }));
+      setInfos(prev => ({ ...prev, [slot]: undefined }));
+      await send(slot, 'stop');
+      await send(slot, 'position fen ' + position);
+      await send(slot, 'go infinite');
+    }));
+  }, [send, setSearchOrigin]);
 
   const requestArenaMove = useCallback(async () => {
     if (!liveRef.current || !['arena', 'tournament'].includes(modeRef.current)) return;
     const slot: Slot = chess.current.turn() === 'w' ? 'white' : 'black';
     if (!readyRef.current[slot] || searching.current) return;
     searching.current = slot;
-    await send(slot, 'position fen ' + chess.current.fen());
-    const think = modeRef.current === 'tournament' && tournamentRef.current
-      ? 'go movetime ' + tournamentRef.current.movetime
+    thinkingStartRef.current = { slot, startedAt: performance.now() };
+    setManualMovePending(false);
+    const position = chess.current.fen();
+    setSearchOrigin(slot, position);
+    setPvs(prev => ({ ...prev, [slot]: [] }));
+    setInfos(prev => ({ ...prev, [slot]: undefined }));
+    await send(slot, 'position fen ' + position);
+    const control = tournamentRef.current?.timeControl || DEFAULT_TIME_CONTROL;
+    const think = modeRef.current === 'tournament'
+      ? buildGoCommand(control, clockRemainingRef.current)
       : 'go depth ' + config.current.depth;
     await send(slot, think);
-  }, [send]);
+  }, [send, setSearchOrigin]);
 
   const commitMove = useCallback((from: string, to: string, promotion = 'q') => {
     try {
@@ -232,23 +269,29 @@ export default function App() {
       setFenInput(chess.current.fen());
       setMoveSan(chess.current.history());
       setLastMove([from, to]);
-      setPvs({ white: [], black: [] });
-      setInfos({ white: undefined, black: undefined });
+      // Keep the most recently-searched PV for each side, anchored to its
+      // original FEN, instead of erasing both on every tournament move.
       return true;
     } catch { return false; }
   }, []);
 
-  const finishArena = useCallback((moveCap = false) => {
+  const finishArena = useCallback((moveCap = false, timeoutLoser?: Slot) => {
+    if (!liveRef.current) return;
     const game = chess.current;
     let whitePoints: 0 | 0.5 | 1 = 0.5;
-    if (game.isCheckmate() && !moveCap) whitePoints = game.turn() === 'w' ? 0 : 1;
-    const label = game.isCheckmate() && !moveCap
+    if (timeoutLoser) whitePoints = timeoutLoser === 'white' ? 0 : 1;
+    else if (game.isCheckmate() && !moveCap) whitePoints = game.turn() === 'w' ? 0 : 1;
+    const label = timeoutLoser
+      ? 'TIME FORFEIT · ' + timeoutLoser.toUpperCase() + ' FLAGGED'
+      : game.isCheckmate() && !moveCap
       ? 'CHECKMATE · ' + (whitePoints === 1 ? 'WHITE WINS' : 'BLACK WINS')
       : moveCap ? 'DRAW · MAX PLY LIMIT'
       : 'DRAW · ' + (game.isStalemate() ? 'STALEMATE' : 'REPETITION / RULE');
     const outcome: GameOutcome = whitePoints === 1 ? '1-0' : whitePoints === 0 ? '0-1' : '1/2-1/2';
     setResult(label);
     searching.current = null;
+    thinkingStartRef.current = null;
+    setManualMovePending(false);
     liveRef.current = false;
     setLive(false);
     const next = recordResult(loadStandings(), namesRef.current.white, namesRef.current.black, whitePoints);
@@ -310,7 +353,7 @@ export default function App() {
         await send(slot, 'setoption name Threads value ' + config.current.threads);
         await send(slot, 'setoption name Hash value ' + config.current.hash);
         await send(slot, 'setoption name MultiPV value ' +
-          (modeRef.current === 'analysis' && slot === 'white' ? config.current.multipv : 1));
+          (modeRef.current === 'analysis' ? config.current.multipv : 1));
         const entry = enginesRef.current.find(e => e.id === assignedRef.current[slot]);
         if (entry) for (const [key, value] of Object.entries(entry.options)) {
           if (!key.includes('\n') && !key.includes('\r') &&
@@ -324,7 +367,7 @@ export default function App() {
     if (line === 'readyok') {
       readyRef.current = { ...readyRef.current, [slot]: true };
       setReady({ ...readyRef.current });
-      if (liveRef.current && modeRef.current === 'analysis' && slot === 'white') {
+      if (liveRef.current && modeRef.current === 'analysis') {
         void searchAnalysis();
       } else if (liveRef.current && (modeRef.current === 'arena' || modeRef.current === 'tournament')) {
         void requestArenaMove();
@@ -336,7 +379,8 @@ export default function App() {
     if (info && (info.depth !== undefined || info.pv.length > 0)) {
       if (info.multipv === 1) {
         setInfos(prev => ({ ...prev, [slot]: info }));
-        const score = whiteEval(info, chess.current.turn());
+        const originTurn = pvOriginsRef.current[slot].split(' ')[1] === 'b' ? 'b' : 'w';
+        const score = whiteEval(info, originTurn);
         const now = Date.now();
         if (score !== null && now - lastSample.current[slot] > 160) {
           lastSample.current[slot] = now;
@@ -355,12 +399,38 @@ export default function App() {
     }
     if (line.startsWith('bestmove ') && (modeRef.current === 'arena' || modeRef.current === 'tournament') &&
       liveRef.current && searching.current === slot) {
+      const tc = tournamentRef.current?.timeControl || DEFAULT_TIME_CONTROL;
+      if (modeRef.current === 'tournament' && tc.mode === 'clock'
+        && thinkingStartRef.current?.slot === slot) {
+        const elapsed = performance.now() - thinkingStartRef.current.startedAt;
+        const remaining = clockRemainingRef.current[slot] - elapsed;
+        if (remaining <= 0) {
+          clockRemainingRef.current = { ...clockRemainingRef.current, [slot]: 0 };
+          setClockDisplay({ ...clockRemainingRef.current });
+          finishArena(false, slot);
+          return;
+        }
+        clockRemainingRef.current = {
+          ...clockRemainingRef.current,
+          [slot]: timeSpent(clockRemainingRef.current[slot], elapsed, tc.incrementSeconds * 1000)
+        };
+        setClockDisplay({ ...clockRemainingRef.current });
+      }
+      thinkingStartRef.current = null;
       searching.current = null;
+      setManualMovePending(false);
       const move = fromUci(line.split(/\s+/)[1] || '');
       if (!move || !commitMove(move.from, move.to, move.promotion)) {
         setNotice('ENGINE ERROR · Illegal or unavailable bestmove from ' + namesRef.current[slot]);
         liveRef.current = false;
         setLive(false);
+        thinkingStartRef.current = null;
+        const running = tournamentRef.current;
+        if (running?.status === 'running') {
+          tournamentRef.current = { ...running, status: 'paused' };
+          setTournament(tournamentRef.current);
+        }
+        slots.forEach(side => { void send(side, 'stop'); });
         return;
       }
       const reachedLimit = modeRef.current === 'tournament' && tournamentRef.current !== null &&
@@ -372,6 +442,24 @@ export default function App() {
       setLines(prev => [slot.toUpperCase() + '  ' + line, ...prev].slice(0, 85));
     }
   }, [commitMove, finishArena, requestArenaMove, searchAnalysis, send]);
+
+  useEffect(() => {
+    if (!live || mode !== 'tournament') return;
+    const ticker = window.setInterval(() => {
+      const run = tournamentRef.current;
+      const current = thinkingStartRef.current;
+      if (!liveRef.current || run?.status !== 'running' ||
+          run.timeControl?.mode !== 'clock' || !current) return;
+      const elapsed = performance.now() - current.startedAt;
+      const remaining = Math.max(0, clockRemainingRef.current[current.slot] - elapsed);
+      setClockDisplay({ ...clockRemainingRef.current, [current.slot]: remaining });
+      if (remaining <= 0) {
+        clockRemainingRef.current = { ...clockRemainingRef.current, [current.slot]: 0 };
+        finishArena(false, current.slot);
+      }
+    }, 100);
+    return () => window.clearInterval(ticker);
+  }, [live, mode, finishArena]);
 
   useEffect(() => {
     const unlisten: UnlistenFn[] = [];
@@ -399,6 +487,10 @@ export default function App() {
   }, [handleLine]);
 
   const clearTelemetry = () => {
+    const position = chess.current.fen();
+    pvOriginsRef.current = { white: position, black: position };
+    setPvOrigins(pvOriginsRef.current);
+    analysisStarted.current = { white: false, black: false };
     setPvs({ white: [], black: [] });
     setInfos({ white: undefined, black: undefined });
     setTelemetry({ white: null, black: null });
@@ -423,13 +515,13 @@ export default function App() {
     clearTelemetry();
     liveRef.current = true;
     setLive(true);
-    setNotice('CONNECTING · Starting UCI analysis session…');
+    setNotice('CONNECTING · Starting both White and Black UCI analysis engines…');
     try {
-      await invoke('launch_engine', { slot: 'white', path: pathsRef.current.white });
+      await Promise.all(slots.map(slot =>
+        invoke('launch_engine', { slot, path: pathsRef.current[slot] })));
     } catch (error) {
-      liveRef.current = false;
-      setLive(false);
-      setNotice('ENGINE START FAILED · ' + String(error));
+      await stopEngines();
+      setNotice('DUAL ANALYSIS START FAILED · ' + String(error));
     }
   };
   const startArena = async () => {
@@ -475,6 +567,8 @@ export default function App() {
       setFenInput(chess.current.fen());
       setMoveSan([]);
       setLastMove(null);
+      clockRemainingRef.current = newGameClocks(current.timeControl || DEFAULT_TIME_CONTROL);
+      setClockDisplay({ ...clockRemainingRef.current });
     }
     const selectedPaths = { white: whiteEntry.path, black: blackEntry.path };
     const selectedNames = { white: whiteEntry.name, black: blackEntry.name };
@@ -528,8 +622,9 @@ export default function App() {
     const run: TournamentRun = {
       id: 'event-' + Date.now(), name: 'Chess X-Ray Round Robin',
       entries: unique, schedule, index: 0, status: 'running',
-      movetime: clamp(settings.movetime, 100, 60000),
+      movetime: clamp(settings.movetime, 50, 600000),
       maxPlies: clamp(settings.maxPlies, 40, 600),
+      timeControl: sanitizeTimeControl(settings.timeControl || DEFAULT_TIME_CONTROL),
       openingBookName: openingMode === 'epd' ? epdBook?.name : undefined
     };
     tournamentRef.current = run;
@@ -539,10 +634,19 @@ export default function App() {
   const pauseTournament = async (): Promise<void> => {
     const run = tournamentRef.current;
     if (!run || run.status !== 'running') return;
+    if (run.timeControl?.mode === 'clock' && thinkingStartRef.current) {
+      const { slot, startedAt } = thinkingStartRef.current;
+      const elapsed = performance.now() - startedAt;
+      clockRemainingRef.current = {
+        ...clockRemainingRef.current,
+        [slot]: Math.max(0, clockRemainingRef.current[slot] - elapsed)
+      };
+      setClockDisplay({ ...clockRemainingRef.current });
+    }
     tournamentRef.current = { ...run, status: 'paused' };
     setTournament(tournamentRef.current);
     await stopEngines();
-    setNotice('TOURNAMENT PAUSED · Resume will restart engines from the current board position.');
+    setNotice('TOURNAMENT PAUSED · Resume restores the remaining clock time and current FEN.');
   };
   const resumeTournament = async (): Promise<void> => {
     const run = tournamentRef.current;
@@ -550,6 +654,15 @@ export default function App() {
     tournamentRef.current = { ...run, status: 'running' };
     setTournament(tournamentRef.current);
     await launchTournamentGame(true);
+  };
+  const stopAndPlay = async (): Promise<void> => {
+    const run = tournamentRef.current;
+    if (!run || run.status !== 'running' || !needsManualStop(run.timeControl || DEFAULT_TIME_CONTROL)
+        || modeRef.current !== 'tournament' || !liveRef.current || !searching.current
+        || manualMovePending) return;
+    setManualMovePending(true);
+    setNotice('UNTIMED SEARCH · Sending stop, awaiting bestmove from the active engine…');
+    await send(searching.current, 'stop');
   };
   const stopTournament = async (): Promise<void> => {
     const run = tournamentRef.current;
@@ -685,14 +798,16 @@ export default function App() {
     } catch { setNotice('CLIPBOARD NOT AVAILABLE · Try copying FEN manually.'); }
   };
 
-  const activeSlot: Slot = mode === 'analysis' ? 'white' : selectedSlot;
+  const activeSlot: Slot = selectedSlot;
   const primary = infos[activeSlot];
   const turn = chess.current.turn();
-  const evaluation = whiteEval(primary, turn);
+  const boardEvalSlot: Slot = mode === 'analysis' ? selectedSlot : (turn === 'w' ? 'white' : 'black');
+  const mainEvalInfo = pvOrigins[boardEvalSlot] === fen ? infos[boardEvalSlot] : undefined;
+  const evaluation = whiteEval(mainEvalInfo, turn);
   const blackPct = evaluation === null ? 50 : Math.max(3, Math.min(97, 50 - evaluation / 18));
   const mainArrows = useMemo<Arrow[]>(() => {
     if (arrowMode === 'off') return [];
-    const currentPvs = pvs[mode === 'analysis' ? 'white' : selectedSlot];
+    const currentPvs = pvOrigins[selectedSlot] === fen ? pvs[selectedSlot] : [];
     if (arrowMode === 'best') {
       const move = fromUci(currentPvs[0]?.pv[0] || '');
       return move ? [{ from: move.from, to: move.to, color: palette[0], width: 14 }] : [];
@@ -713,9 +828,30 @@ export default function App() {
       });
     });
     return result;
-  }, [arrowMode, fen, mode, pvs, selectedSlot]);
+  }, [arrowMode, fen, pvs, pvOrigins, selectedSlot]);
 
   const currentPvs = pvs[activeSlot];
+  const setPvBoardSize = useCallback((slot: Slot, size: number) => {
+    const next = clamp(Math.round(size / 10) * 10, 160, 760);
+    setLayout(prev => slot === 'white'
+      ? { ...prev, pvWhiteBoardSize: next }
+      : { ...prev, pvBlackBoardSize: next });
+  }, []);
+  const pvBoardProps: PvBoardGroupProps = {
+    names, variations: pvs, originFens: pvOrigins, currentFen: fen,
+    sizes: { white: layout.pvWhiteBoardSize, black: layout.pvBlackBoardSize },
+    onSizeChange: setPvBoardSize,
+    selectedSlot, onSelectSlot: setSelectedSlot,
+    flipped, theme: boardTheme, live, mode
+  };
+  useEffect(() => {
+    if (!pvFocused) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setPvFocused(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [pvFocused]);
   const engineMetrics = [
     { label: 'DEPTH / SEL', value: (primary?.depth ?? '—') + ' / ' + (primary?.seldepth ?? '—'), icon: <Layers3 size={16} /> },
     { label: 'SEARCH NODES', value: shortNumber(primary?.nodes), icon: <GitBranch size={16} /> },
@@ -734,10 +870,12 @@ export default function App() {
 
   return <div className={'app-root' + (layout.boardFocus ? ' board-focus' : '')}
     style={{
-      '--pv-width': 'min(' + layout.pvWidth + 'px, max(300px, calc(100vw - 820px)))',
+      '--pv-width': 'min(' + layout.pvWidth + 'px, max(300px, calc(100vw - 650px)))',
       '--board-max': layout.boardSize + 'px',
-      '--pv-mini': layout.pvBoardSize + 'px',
-      '--pv-font': layout.pvFontSize + 'px'
+      '--pv-mini': Math.max(layout.pvWhiteBoardSize, layout.pvBlackBoardSize) + 'px',
+      '--pv-font': layout.pvFontSize + 'px',
+      '--white-pv-size': layout.pvWhiteBoardSize + 'px',
+      '--black-pv-size': layout.pvBlackBoardSize + 'px'
     } as CSSProperties}>
     <header className="topbar">
       <nav className="app-menubar" aria-label="Main application menu">
@@ -798,6 +936,12 @@ export default function App() {
               else void (mode === 'analysis' ? startAnalysis() : startArena());
             }}><Play size={16} fill="currentColor" /> {mode === 'analysis' ? 'START ANALYSIS' : mode === 'arena' ? 'START MATCH' : 'TOURNAMENT CONTROL'}</button>
             <button className="secondary-action" onClick={() => void stopEngines()} disabled={!live}><Pause size={16} /> Stop engines</button>
+            {mode === 'tournament' && tournament?.status === 'running' &&
+              needsManualStop(tournament.timeControl || DEFAULT_TIME_CONTROL) &&
+              <button className="manual-bestmove-button" disabled={!searching.current || manualMovePending}
+                onClick={() => void stopAndPlay()}><Play size={15}/>
+                {manualMovePending ? 'Waiting for bestmove…' : 'Stop & Play bestmove'}
+              </button>}
           </div>
         </div>
         <div className="sidebar-section compact">
@@ -841,7 +985,7 @@ export default function App() {
         <div className="match-banner">
           <div className="player-title"><span className="player-color white" /> <div><b>{formatName(names.white)}</b><small>WHITE ENGINE</small></div></div>
           <div className="match-center"><span className="eyebrow">LIVE EVALUATION · WHITE POV</span>
-            <strong className="score-large">{scoreLabel(mode !== 'analysis' ? infos[chess.current.turn() === 'w' ? 'white' : 'black'] : infos.white, turn)}</strong>
+            <strong className="score-large">{scoreLabel(mainEvalInfo, turn)}</strong>
             <span className="position-label">{chess.current.isCheck() ? 'CHECK' : 'POSITION EVALUATION'}</span></div>
           <div className="player-title right"><div><b>{formatName(names.black)}</b><small>BLACK ENGINE</small></div><span className="player-color black" /></div>
         </div>
@@ -854,6 +998,20 @@ export default function App() {
             GAME {Math.min(tournament.index + 1, tournament.schedule.length)} / {tournament.schedule.length}
             {' · '}{tournament.openingBookName ? 'EPD: ' + tournament.openingBookName : 'STARTPOS'}</span>}
         </div>
+        {mode === 'tournament' && tournament && <div className="tournament-clock-strip">
+          <span><b>EVENT</b> {tournament.index + 1} / {tournament.schedule.length} games</span>
+          {tournament.timeControl?.mode === 'clock' ? <>
+            <span className={thinkingStartRef.current?.slot === 'white' ? 'clock-active' : ''}>
+              WHITE <strong>{formatClock(clockDisplay.white)}</strong></span>
+            <span className={thinkingStartRef.current?.slot === 'black' ? 'clock-active' : ''}>
+              BLACK <strong>{formatClock(clockDisplay.black)}</strong></span>
+            <span className="increment-label">+{tournament.timeControl.incrementSeconds}s / move</span>
+          </> : <span className="clock-untimed-label">
+            {tournament.timeControl?.mode === 'infinite'
+              ? needsManualStop(tournament.timeControl) ? 'INFINITE · MANUAL STOP'
+                : 'INFINITE · DEPTH/NODE CAPS'
+              : 'FIXED MOVE TIME · ' + (tournament.timeControl?.movetimeMs || 1000) + ' ms'}</span>}
+        </div>}
         <div className="board-and-insight">
           <div className="board-cluster">
             <div className="board-with-bar">
@@ -896,7 +1054,7 @@ export default function App() {
             <button key={key} className={metric === key ? 'tab-active' : ''} onClick={() => setMetric(key)}>{text}</button>)}
         </div><span className="chart-note"><BarChart3 size={15} /> Live performance timeline</span></div>
         <Timeline data={samples} metric={metric} />
-        <SearchTree fen={fen} pvs={currentPvs} theme={boardTheme} flipped={flipped} />
+        <SearchTree fen={pvOrigins[activeSlot]} pvs={currentPvs} theme={boardTheme} flipped={flipped} />
         <section className="panel standings-panel">
           <div className="panel-heading"><div><Banner>LOCAL MATCH RESULTS</Banner><h3><Trophy size={18} /> Engine rankings</h3></div>
             <span className="source-pill">CCRL 40/15 ANCHOR</span></div>
@@ -919,7 +1077,7 @@ export default function App() {
             const startX = event.clientX;
             const startWidth = layout.pvWidth;
             const move = (next: MouseEvent) => setLayout(current =>
-              ({ ...current, pvWidth: clamp(startWidth + startX - next.clientX, 280, 850) }));
+              ({ ...current, pvWidth: clamp(startWidth + startX - next.clientX, 300, 1100) }));
             const up = () => {
               window.removeEventListener('mousemove', move);
               window.removeEventListener('mouseup', up);
@@ -929,30 +1087,12 @@ export default function App() {
           }}><span/></div>
         <section className="right-section pv-primary-section">
           <div className="pv-width-toolbar"><SlidersHorizontal size={13}/>
-            <label>PV panel</label>
-            <input aria-label="PV panel width" type="range" min="280" max="850" step="10"
-              value={layout.pvWidth} onChange={event => setLayout(prev => ({ ...prev, pvWidth: Number(event.target.value) }))}/>
+            <label htmlFor="pv-panel-width">PV column</label>
+            <input id="pv-panel-width" type="range" min="300" max="1100" step="10" value={layout.pvWidth}
+              onChange={event => setLayout(prev => ({ ...prev, pvWidth: Number(event.target.value) }))}/>
             <output>{layout.pvWidth}px</output>
           </div>
-          <div className="panel-heading"><div><Banner>PRINCIPAL VARIATIONS</Banner><h3><GitBranch size={18} /> Candidate moves</h3></div><span className="source-pill">MULTIPV {mode === 'analysis' ? multipv : 1}</span></div>
-          {mode !== 'analysis' && <div className="slot-selector"><button className={selectedSlot === 'white' ? 'selected' : ''} onClick={() => setSelectedSlot('white')}>WHITE PV</button>
-            <button className={selectedSlot === 'black' ? 'selected' : ''} onClick={() => setSelectedSlot('black')}>BLACK PV</button></div>}
-          <div className="pv-list">
-            {currentPvs.length === 0 && <div className="empty-state"><GitBranch size={36} /><b>Waiting for PV data</b><span>Start analysis to inspect the engine's search lines in real time.</span></div>}
-            {currentPvs.map((line, i) => {
-              const legal = legalPv(fen, line.pv, 14);
-              const preview = legalPv(fen, line.pv, 5);
-              return <div className={'pv-card pv-' + (i + 1)} key={line.multipv}>
-                <div className="pv-header"><span className="pv-index">#{line.multipv}</span><strong>{scoreLabel(line, turn)}</strong><span className="pv-depth">D {line.depth ?? '—'}</span></div>
-                <div className="pv-detail"><ChessBoard fen={preview.fen} mini flipped={flipped} theme={boardTheme} />
-                  <div><div className="pv-sequence">{legal.san.length ? legal.san.join(' ') : 'Waiting for legal line...'}</div>
-                    {legal.uci[0] && <button className="pv-apply" onClick={() => {
-                      const move = fromUci(legal.uci[0]);
-                      if (move) manualMove(move.from, move.to);
-                    }}>Play first move <ChevronRight size={14} /></button>}</div></div>
-              </div>;
-            })}
-          </div>
+          <PvBoards {...pvBoardProps} onExpand={() => setPvFocused(true)} />
         </section>
         <section className="right-section xray-section">
           <div className="panel-heading"><div><Banner>SEARCH INTERNALS</Banner><h3><Eye size={18} /> X-Ray telemetry</h3></div><span className="source-pill muted">OPT-IN</span></div>
@@ -968,6 +1108,19 @@ export default function App() {
         </section>
       </aside>
     </div>
+    {pvFocused && <div className="pv-wide-backdrop" role="presentation"
+      onMouseDown={event => { if (event.currentTarget === event.target) setPvFocused(false); }}>
+      <section className="pv-wide-dialog" role="dialog" aria-modal="true" aria-label="White and Black PV enlarged boards">
+        <header className="pv-wide-heading">
+          <div><span className="eyebrow">REAL 8×8 CHESSBOARDS / INDEPENDENT SIZES</span>
+            <h2>White PV <span>+</span> Black PV</h2></div>
+          <button onClick={() => setPvFocused(false)} aria-label="Close wide PV viewer">
+            <X size={18} /> Return to analysis
+          </button>
+        </header>
+        <PvBoards {...pvBoardProps} expanded />
+      </section>
+    </div>}
     {controlTab && <ControlCenter
       tab={controlTab} onTab={setControlTab} onClose={() => setControlTab(null)}
       layout={layout} onLayout={setLayout} engines={engines}
@@ -981,7 +1134,7 @@ export default function App() {
       onChooseEpdBook={chooseEpdBook} onReloadEpdBook={reloadEpdBook}
       onClearEpdBook={clearEpdBook} onStartTournament={startTournament}
       onPauseTournament={pauseTournament} onResumeTournament={resumeTournament}
-      onStopTournament={stopTournament} />}
+      onStopTournament={stopTournament} onStopAndPlay={stopAndPlay} />}
     <footer className="statusbar"><span><i className={'status-dot' + (live ? ' active' : '')} />{notice}</span>
       <div><span>RUST / TAURI 2</span><span className="footer-sep">/</span><span>UCI NATIVE</span><span className="footer-sep">/</span><span><Download size={12} /> OFFLINE STOCKFISH 19</span></div></footer>
   </div>;

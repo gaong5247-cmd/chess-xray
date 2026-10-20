@@ -6,18 +6,20 @@ import {
 } from 'lucide-react';
 import type { EngineEntry, UciOption } from './engines';
 import type { EpdBook, OpeningMode } from './epd';
+import { DEFAULT_TIME_CONTROL, needsManualStop, sanitizeTimeControl, type TimeControl } from './timeControls';
 import { createRoundRobin, tournamentTable, type TournamentConfig, type TournamentRun } from './tournament';
 
 export type ControlTab = 'configure' | 'tournament' | 'engines';
 export interface LayoutPrefs {
   boardSize: number;
   pvWidth: number;
-  pvBoardSize: number;
+  pvWhiteBoardSize: number;
+  pvBlackBoardSize: number;
   pvFontSize: number;
   boardFocus: boolean;
 }
 export const DEFAULT_LAYOUT: LayoutPrefs = {
-  boardSize: 760, pvWidth: 460, pvBoardSize: 136, pvFontSize: 13, boardFocus: true
+  boardSize: 760, pvWidth: 560, pvWhiteBoardSize: 340, pvBlackBoardSize: 340, pvFontSize: 13, boardFocus: true
 };
 const LAYOUT_KEY = 'chess-xray-layout-v1';
 export function clamp(value: number, min: number, max: number) {
@@ -29,8 +31,9 @@ export function loadLayout(): LayoutPrefs {
     if (!object) return { ...DEFAULT_LAYOUT };
     return {
       boardSize: clamp(Number(object.boardSize) || 760, 320, 1100),
-      pvWidth: clamp(Number(object.pvWidth) || 460, 280, 850),
-      pvBoardSize: clamp(Number(object.pvBoardSize) || 136, 72, 260),
+      pvWidth: clamp(Number(object.pvWidth) || 560, 300, 1100),
+      pvWhiteBoardSize: clamp(Number(object.pvWhiteBoardSize) || 340, 160, 760),
+      pvBlackBoardSize: clamp(Number(object.pvBlackBoardSize) || 340, 160, 760),
       pvFontSize: clamp(Number(object.pvFontSize) || 13, 10, 21),
       boardFocus: object.boardFocus !== false
     };
@@ -69,6 +72,7 @@ type ControlProps = {
   onPauseTournament: () => Promise<void>;
   onResumeTournament: () => Promise<void>;
   onStopTournament: () => Promise<void>;
+  onStopAndPlay: () => Promise<void>;
 };
 
 const panels: { key: ControlTab; label: string; sub: string }[] = [
@@ -114,17 +118,32 @@ export default function ControlCenter(props: ControlProps) {
     tab, onTab, onClose, layout, onLayout, engines, onAddEngine,
     onRemoveEngine, onRenameEngine, onInspectEngine, inspectingId,
     onOption, onAssign, tournament, onStartTournament,
-    onPauseTournament, onResumeTournament, onStopTournament,
+    onPauseTournament, onResumeTournament, onStopTournament, onStopAndPlay,
     epdBook, epdLoading, epdError, openingMode, onOpeningMode,
     pairBookColors, onPairBookColors, onChooseEpdBook, onReloadEpdBook, onClearEpdBook
   } = props;
   const [engineId, setEngineId] = useState<string>(engines[0]?.id || '');
   const [selectedEntrants, setSelectedEntrants] = useState<string[]>(() =>
     tournament?.entries ?? engines.map(e => e.id));
-  const [cycles, setCycles] = useState(1);
+  const [gameCount, setGameCount] = useState(() => {
+    try { return clamp(Number(localStorage.getItem('xray-game-count')) || 100, 1, 50000); }
+    catch { return 100; }
+  });
   const [doubleRound, setDoubleRound] = useState(true);
-  const [movetime, setMovetime] = useState(1000);
+  const [timeControl, setTimeControl] = useState<TimeControl>(() => {
+    try {
+      const stored = localStorage.getItem('xray-time-control');
+      return stored ? sanitizeTimeControl(JSON.parse(stored) as TimeControl) : DEFAULT_TIME_CONTROL;
+    } catch { return { ...DEFAULT_TIME_CONTROL }; }
+  });
+  const updateTime = (changes: Partial<TimeControl>) => {
+    setTimeControl(prev => sanitizeTimeControl({ ...prev, ...changes }));
+  };
   const [maxPlies, setMaxPlies] = useState(260);
+  useEffect(() => {
+    localStorage.setItem('xray-game-count', String(gameCount));
+    localStorage.setItem('xray-time-control', JSON.stringify(timeControl));
+  }, [gameCount, timeControl]);
   const [error, setError] = useState('');
   const selectedEngine = engines.find(e => e.id === engineId) || engines[0];
 
@@ -133,8 +152,8 @@ export default function ControlCenter(props: ControlProps) {
   } window.addEventListener('keydown', onEsc); return () => window.removeEventListener('keydown', onEsc); }, [onClose]);
   const config = useMemo<TournamentConfig>(() => ({
     entrants: selectedEntrants.filter(id => engines.some(e => e.id === id)),
-    cycles, doubleRound, movetime, maxPlies
-  }), [selectedEntrants, engines, cycles, doubleRound, movetime, maxPlies]);
+    cycles: 1, gameCount, doubleRound, movetime: timeControl.movetimeMs, maxPlies, timeControl
+  }), [selectedEntrants, engines, gameCount, doubleRound, timeControl, maxPlies]);
   const preview = useMemo(() => createRoundRobin(config), [config]);
   const tournamentRows = useMemo(() => tournamentTable(tournament, engines), [tournament, engines]);
   const updateLayout = (key: keyof LayoutPrefs, value: number | boolean) =>
@@ -169,21 +188,23 @@ export default function ControlCenter(props: ControlProps) {
         <div className="control-main">
           {tab === 'configure' && <>
             <div className="control-section-title"><LayoutGrid size={20}/><div><h3>Workspace layout</h3>
-              <p>Make the chess board and PV column as large as you like. Your settings are saved locally.</p></div></div>
+              <p>Resize the main board, the White PV board and the Black PV board independently. These are actual chessboard dimensions, not a zoomed layer.</p></div></div>
             <div className="layout-grid">
               <NumericSlider label="Main board maximum size" value={layout.boardSize} min={320} max={1100} step={10}
                 onChange={value => updateLayout('boardSize', value)} />
-              <NumericSlider label="Right PV panel width" value={layout.pvWidth} min={280} max={850} step={10}
+              <NumericSlider label="Right PV column width" value={layout.pvWidth} min={300} max={1100} step={10}
                 onChange={value => updateLayout('pvWidth', value)} />
-              <NumericSlider label="PV preview board size" value={layout.pvBoardSize} min={72} max={260} step={4}
-                onChange={value => updateLayout('pvBoardSize', value)} />
+              <NumericSlider label="WHITE PV chessboard (actual size)" value={layout.pvWhiteBoardSize} min={160} max={760} step={10}
+                onChange={value => updateLayout('pvWhiteBoardSize', value)} />
+              <NumericSlider label="BLACK PV chessboard (actual size)" value={layout.pvBlackBoardSize} min={160} max={760} step={10}
+                onChange={value => updateLayout('pvBlackBoardSize', value)} />
               <NumericSlider label="PV move text size" value={layout.pvFontSize} min={10} max={21} suffix="px"
                 onChange={value => updateLayout('pvFontSize', value)} />
             </div>
             <label className="toggle-row"><input type="checkbox" checked={layout.boardFocus}
               onChange={e => updateLayout('boardFocus', e.target.checked)}/>
               <span><b>Board-first layout</b><small>Show the main board at full center-column width; move search stats below it.</small></span></label>
-            <div className="layout-tips"><Gauge size={17}/> You can also drag the grip on the left edge of the PV panel to resize it directly. Sizes are persistent across launches.</div>
+            <div className="layout-tips"><Gauge size={17}/> Each PV board has its own slider and a corner grip to resize its actual 8×8 board. Open Wide dual-board view to enlarge both at the same time. Sizes persist across launches.</div>
             <div className="control-buttons"><button className="plain-control-button" onClick={() => onLayout({ ...DEFAULT_LAYOUT })}>
               <RotateCcw size={15}/> Reset default layout</button>
               <button className="affirm-control-button" onClick={onClose}><Check size={15}/> Apply layout</button></div>
@@ -244,6 +265,8 @@ export default function ControlCenter(props: ControlProps) {
                 <strong>{tournament.status.toUpperCase()} · {Math.min(tournament.index, tournament.schedule.length)} / {tournament.schedule.length} games finished</strong>
               </div><div className="event-progress"><span style={{width: (100 * tournament.index / Math.max(1, tournament.schedule.length)) + '%'}}/></div>
               <div className="event-actions">
+                {tournament.status === 'running' && needsManualStop(tournament.timeControl || DEFAULT_TIME_CONTROL) &&
+                  <button onClick={() => void onStopAndPlay()}><Play size={14}/> Stop &amp; play move</button>}
                 {tournament.status === 'running' && <button onClick={() => void onPauseTournament()}><Pause size={14}/> Pause</button>}
                 {tournament.status === 'paused' && <button onClick={() => void onResumeTournament()}><Play size={14}/> Resume current game</button>}
                 {(tournament.status === 'running' || tournament.status === 'paused') &&
@@ -302,13 +325,79 @@ export default function ControlCenter(props: ControlProps) {
               <div>
                 <h4>Event settings</h4>
                 <div className="event-settings">
-                  <label>Tournament cycles<input type="number" value={cycles} min={1} max={20} onChange={e => setCycles(clamp(Number(e.target.value) || 1, 1, 20))}/></label>
-                  <label>Time per move (ms)<input type="number" value={movetime} min={100} max={60000} step={100} onChange={e => setMovetime(clamp(Number(e.target.value) || 100, 100, 60000))}/></label>
-                  <label>Max plies / game<input type="number" value={maxPlies} min={40} max={600} step={10} onChange={e => setMaxPlies(clamp(Number(e.target.value) || 40, 40, 600))}/></label>
-                  <label className="event-check"><input type="checkbox" checked={doubleRound} onChange={e => setDoubleRound(e.target.checked)}/> Play reversed-color return legs</label>
+                  <label className="event-wide-input">Total games (exact)
+                    <input aria-label="Total tournament games" type="number" min={1} max={50000}
+                      value={gameCount} onChange={e => setGameCount(clamp(Math.floor(Number(e.target.value) || 1), 1, 50000))} />
+                  </label>
+                  <label>Max moves in plies per game
+                    <input type="number" min={40} max={600} step={10} value={maxPlies}
+                      onChange={e => setMaxPlies(clamp(Number(e.target.value) || 40, 40, 600))}/>
+                  </label>
+                  <label className="event-check event-wide-input">
+                    <input type="checkbox" checked={doubleRound} onChange={e => setDoubleRound(e.target.checked)}/>
+                    Alternate colors (two-leg matchups)
+                  </label>
                 </div>
+                <h4 className="time-control-heading">Engine search / time control</h4>
+                <div className="time-mode-choices" role="radiogroup" aria-label="Search limit mode">
+                  <label className={timeControl.mode === 'clock' ? 'chosen' : ''}>
+                    <input type="radio" name="search-mode" checked={timeControl.mode === 'clock'}
+                      onChange={() => updateTime({ mode: 'clock' })}/>
+                    Clock + Increment
+                  </label>
+                  <label className={timeControl.mode === 'movetime' ? 'chosen' : ''}>
+                    <input type="radio" name="search-mode" checked={timeControl.mode === 'movetime'}
+                      onChange={() => updateTime({ mode: 'movetime' })}/>
+                    Fixed move time
+                  </label>
+                  <label className={timeControl.mode === 'infinite' ? 'chosen' : ''}>
+                    <input type="radio" name="search-mode" checked={timeControl.mode === 'infinite'}
+                      onChange={() => updateTime({ mode: 'infinite' })}/>
+                    Infinite (untimed)
+                  </label>
+                </div>
+                {timeControl.mode === 'clock' && <div className="time-mode-fields">
+                  <label>Starting time, minutes
+                    <input type="number" aria-label="Starting clock minutes" min={0.1} max={1440} step={0.5}
+                      value={timeControl.initialSeconds / 60}
+                      onChange={e => updateTime({ initialSeconds: Math.max(1, Number(e.target.value) * 60 || 1) })}/>
+                  </label>
+                  <label>Increment, seconds per move
+                    <input type="number" aria-label="Fischer increment seconds" min={0} max={3600} step={0.1}
+                      value={timeControl.incrementSeconds}
+                      onChange={e => updateTime({ incrementSeconds: Math.max(0, Number(e.target.value) || 0) })}/>
+                  </label>
+                  <p>UCI sends both clocks and increments (wtime/btime/winc/binc). Each completed legal move earns the chosen increment. For example, 3 + 2 or 10 + 5.</p>
+                </div>}
+                {timeControl.mode === 'movetime' && <div className="time-mode-fields">
+                  <label>Thinking time per move (milliseconds)
+                    <input type="number" min={50} max={600000} step={50}
+                      value={timeControl.movetimeMs}
+                      onChange={e => updateTime({ movetimeMs: clamp(Number(e.target.value) || 50, 50, 600000) })}/>
+                  </label>
+                  <p>Every move uses a fixed thinking period (UCI go movetime). No chess clock or increment applies in this mode.</p>
+                </div>}
+                {timeControl.mode === 'infinite' && <div className="time-mode-fields">
+                  <label>Maximum depth (0 = unlimited)
+                    <input type="number" aria-label="Infinite depth limit" min={0} max={255}
+                      value={timeControl.depthLimit}
+                      onChange={e => updateTime({ depthLimit: clamp(Number(e.target.value) || 0, 0, 255) })}/>
+                  </label>
+                  <label>Maximum nodes (0 = unlimited)
+                    <input type="number" aria-label="Infinite node limit" min={0} max={1000000000000} step={1000}
+                      value={timeControl.nodesLimit}
+                      onChange={e => updateTime({ nodesLimit: clamp(Number(e.target.value) || 0, 0, 1000000000000) })}/>
+                  </label>
+                  <p>{needsManualStop(timeControl)
+                    ? 'No caps: go infinite. Use Stop & play move to make the engine commit its best move.'
+                    : 'Depth/nodes caps: untimed go depth/nodes (without the infinite keyword). The search ends on the first reached limit.'}</p>
+                </div>}
                 <div className="tournament-preview"><Swords size={15}/><strong>{preview.length} scheduled games</strong>
-                  <span>Round robin · fixed think time · local Elo estimates</span></div>
+                  <span>Exact game count · {timeControl.mode === 'clock'
+                    ? (timeControl.initialSeconds / 60) + ' min + ' + timeControl.incrementSeconds + ' sec increment'
+                    : timeControl.mode === 'movetime' ? timeControl.movetimeMs + ' ms/move'
+                    : needsManualStop(timeControl) ? 'Infinite, manual stop' :
+                    'Untimed search with node/depth caps'}</span></div>
                 <button className="affirm-control-button tournament-start" disabled={config.entrants.length < 2 || epdLoading ||
                   (openingMode === 'epd' && !epdBook) || tournament?.status === 'running'} onClick={() => void runNewEvent()}>
                   <Play size={16}/> Start new tournament
@@ -324,16 +413,23 @@ export default function ControlCenter(props: ControlProps) {
                   <td>{row.played}</td><td>{row.won}</td><td>{row.drawn}</td><td>{row.lost}</td>
                 </tr>)}</tbody></table></div>
               <h4 className="event-table-heading">Game schedule and results</h4>
+              <div className="schedule-window-label">
+                Displaying games {Math.max(1, tournament.index - 19)}–{Math.min(tournament.schedule.length, tournament.index + 180)}
+                {' '}of {tournament.schedule.length.toLocaleString()} (only nearby rows are rendered for performance).
+              </div>
               <div className="event-table-scroll game-list"><table><thead><tr>
                 <th>#</th><th>Round</th><th>White</th><th>Black</th><th>Opening FEN</th><th>Result</th></tr></thead>
-                <tbody>{tournament.schedule.map((game,i) => <tr key={game.id}
-                  className={i === tournament.index ? 'current-game' : ''}>
+                <tbody>{tournament.schedule.slice(
+                  Math.max(0, tournament.index - 20),
+                  Math.min(tournament.schedule.length, tournament.index + 180)
+                ).map(game => <tr key={game.id}
+                  className={game.number - 1 === tournament.index ? 'current-game' : ''}>
                   <td>{game.number}</td><td>{game.round}</td>
                   <td>{engines.find(e => e.id === game.whiteId)?.name || game.whiteId}</td>
                   <td>{engines.find(e => e.id === game.blackId)?.name || game.blackId}</td>
                   <td><code className="book-schedule-fen" title={game.openingFen || 'Standard start'}>
                     {game.openingFen ? game.openingFen.split(' ')[0] : 'startpos'}</code></td>
-                  <td>{game.outcome || (i === tournament.index && tournament.status === 'running' ? 'LIVE' : '—')}</td>
+                  <td>{game.outcome || (game.number - 1 === tournament.index && tournament.status === 'running' ? 'LIVE' : '—')}</td>
                 </tr>)}</tbody></table></div>
             </>}
           </>}

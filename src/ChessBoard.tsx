@@ -36,15 +36,17 @@ function ArrowLayer({ arrows, flipped }: { arrows: Arrow[]; flipped: boolean }) 
     })}
   </svg>;
 }
-export function ChessBoard({ fen, arrows = [], mini = false, flipped = false, theme = 'broadcast', lastMove, onMove }: {
+export function ChessBoard({ fen, arrows = [], mini = false, flipped = false, theme = 'broadcast', lastMove, onMove, readOnly = false }: {
   fen: string;
   arrows?: Arrow[];
   mini?: boolean;
+  readOnly?: boolean;
   flipped?: boolean;
   theme?: BoardTheme;
   lastMove?: [string, string] | null;
   onMove?: (from: string, to: string) => void;
 }) {
+  const interactive = !mini && !readOnly && !!onMove;
   const game = useMemo(() => { try { return new Chess(fen); } catch { return new Chess(); } }, [fen]);
   const [selected, setSelected] = useState<string | null>(null);
   useEffect(() => setSelected(null), [fen]);
@@ -54,7 +56,7 @@ export function ChessBoard({ fen, arrows = [], mini = false, flipped = false, th
   const squares = 'abcdefgh';
   const squareName = (x: number, y: number) => (flipped ? squares[7 - x] + (y + 1) : squares[x] + (8 - y));
   const choose = (square: string) => {
-    if (mini || !onMove) return;
+    if (!interactive || !onMove) return;
     if (selected && selected !== square && valid.includes(square as Square)) {
       onMove(selected, square);
       setSelected(null);
@@ -74,14 +76,14 @@ export function ChessBoard({ fen, arrows = [], mini = false, flipped = false, th
             (selected === square ? ' selected' : '') +
             (valid.includes(square as Square) ? ' legal' : '')}
           onClick={() => choose(square)}
-          onDragOver={mini ? undefined : e => e.preventDefault()}
-          onDrop={mini ? undefined : e => {
+          onDragOver={!interactive ? undefined : e => e.preventDefault()}
+          onDrop={!interactive ? undefined : e => {
             e.preventDefault();
             const from = e.dataTransfer.getData('text/plain');
             if (onMove && /^[a-h][1-8]$/.test(from)) onMove(from, square);
           }}>
-          {piece && <img alt={piece.color + piece.type} draggable={!mini}
-            onDragStart={e => { if (!mini) e.dataTransfer.setData('text/plain', square); }}
+          {piece && <img alt={piece.color + piece.type} draggable={interactive}
+            onDragStart={e => { if (interactive) e.dataTransfer.setData('text/plain', square); }}
             src={'/pieces/cburnett/' + piece.color + piece.type.toUpperCase() + '.svg'} />}
           {!mini && x === 0 && <span className="rank-label">{flipped ? y + 1 : 8 - y}</span>}
           {!mini && y === 7 && <span className="file-label">{flipped ? squares[7 - x] : squares[x]}</span>}

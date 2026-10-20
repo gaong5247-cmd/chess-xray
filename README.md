@@ -40,3 +40,13 @@ License: GPL-3.0-or-later. Lichess Cburnett chess pieces GPL-2.0-or-later. Third
 In **Tournament** choose **Select .epd file**, then **Random FEN from EPD** to start every game from a random sampled position. Return games with swapped colors use the same FEN by default; this can be toggled off. The app streams multi-million-line books into a bounded 4,096-position reservoir and checks selected sample candidates with chess.js, with no file upload.
 
 Detailed usage: [EPD opening books](docs/EPD_BOOKS.md) · [Demo positions](examples/demo-openings.epd).
+
+## v0.4.0: Dual PV board explorer and flexible tournament controls
+
+- White PV and Black PV now remain visible together, with real independently sized chessboards, per-board 160–760px sliders, draggable corner resize handles, PV move stepping, and a wide two-board view.
+- Analysis launches both assigned UCI engines on the current position. During tournaments, each side's displayed PV is tied to the FEN it actually analyzed.
+- Tournament total game count is directly editable (1 to 50,000). Mirrored games alternate colors with matching EPD starting positions.
+- Three search modes: **Clock + Fischer increment**, **Fixed think time per move**, and **Infinite/untimed**. Untimed mode supports optional maximum depth, maximum nodes, or both. With neither cap, a manual **Stop & Play bestmove** button controls each move.
+- Real clock mode uses UCI wtime/btime/winc/binc, displays both remaining clocks, deducts elapsed time, handles flag falls, and preserves clock time on pause/resume.
+
+See [dual PV and tournament search mode documentation](docs/DUAL_PV_AND_TIME_CONTROLS.md).
