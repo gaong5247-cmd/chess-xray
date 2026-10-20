@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { ChessBoard, type Arrow, type BoardTheme } from './ChessBoard';
 import Timeline, { type Metric, type Sample } from './Timeline';
+import SearchTree from './SearchTree';
 import {
   type Slot, type UciInfo, type XrayTelemetry,
   fromUci, legalPv, parseUciInfo, parseXrayTelemetry, scoreLabel, shortNumber, whiteEval
@@ -54,7 +55,16 @@ export default function App() {
   const [ready, setReady] = useState<SlotMap<boolean>>({ white: false, black: false });
   const readyRef = useRef<SlotMap<boolean>>({ white: false, black: false });
   const searching = useRef<Slot | null>(null);
-  const [paths, setPaths] = useState<SlotMap<string>>(defaultPaths);
+  const [paths, setPaths] = useState<SlotMap<string>>(() => {
+    try {
+      const value: unknown = JSON.parse(localStorage.getItem('chess-xray-engine-paths') || 'null');
+      if (value && typeof value === 'object' && 'white' in value && 'black' in value &&
+        typeof value.white === 'string' && typeof value.black === 'string') {
+        return { white: value.white, black: value.black };
+      }
+    } catch { /* fresh installation */ }
+    return defaultPaths;
+  });
   const pathsRef = useRef<SlotMap<string>>(defaultPaths);
   const [names, setNames] = useState<SlotMap<string>>(defaultNames);
   const namesRef = useRef<SlotMap<string>>(defaultNames);
@@ -79,7 +89,7 @@ export default function App() {
   const [hash, setHash] = useState(128);
   const config = useRef({ multipv, depth, threads, hash });
   useEffect(() => { config.current = { multipv, depth, threads, hash }; }, [multipv, depth, threads, hash]);
-  useEffect(() => { pathsRef.current = paths; }, [paths]);
+  useEffect(() => { pathsRef.current = paths; localStorage.setItem('chess-xray-engine-paths', JSON.stringify(paths)); }, [paths]);
   useEffect(() => { namesRef.current = names; }, [names]);
 
   const send = useCallback(async (slot: Slot, command: string) => {
@@ -507,6 +517,7 @@ export default function App() {
             <button key={key} className={metric === key ? 'tab-active' : ''} onClick={() => setMetric(key)}>{text}</button>)}
         </div><span className="chart-note"><BarChart3 size={15} /> Live performance timeline</span></div>
         <Timeline data={samples} metric={metric} />
+        <SearchTree fen={fen} pvs={currentPvs} theme={boardTheme} flipped={flipped} />
         <section className="panel standings-panel">
           <div className="panel-heading"><div><Banner>LOCAL MATCH RESULTS</Banner><h3><Trophy size={18} /> Engine rankings</h3></div>
             <span className="source-pill">CCRL 40/15 ANCHOR</span></div>

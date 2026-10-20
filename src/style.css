@@ -236,3 +236,19 @@ button:disabled { cursor: not-allowed; opacity: .42; }
  .title-actions button { padding: 7px; font-size: 0; }
  .title-actions button svg { width: 18px; }
 }
+
+/* Interactive principal-variation forest: only actual MultiPV nodes are shown. */
+.search-tree-panel { padding: 17px 19px 15px; margin-bottom: 19px; }
+.tree-summary { display: flex; align-items: center; gap: 6px; color: #829bb2; font-size: 10px; font-weight: 700; }
+.tree-scroller { margin-top: 13px; background: #0c1723; border: 1px solid #273b4b; border-radius: 8px; overflow-x: auto; overflow-y: hidden; scrollbar-color: #38566a transparent; }
+.tree-scroller svg { display: block; max-height: 465px; }
+.tree-node { cursor: pointer; }
+.tree-node:hover rect { stroke: #c7f379; }
+.tree-node text { pointer-events: none; user-select: none; }
+.tree-inspector { margin-top: 12px; display: flex; gap: 14px; border: 1px solid #304758; background: #17283a; border-radius: 7px; padding: 11px; align-items: center; }
+.tree-inspector .mini-board { width: 96px; max-width: 96px; }
+.tree-inspector > div:last-child { min-width: 0; flex: 1; }
+.tree-inspector strong { display: block; color: #e3f5de; font: 700 13px "Space Grotesk"; margin: 9px 0; word-break: break-word; }
+.tree-inspector small { font-size: 9px; color: #a7bcd1; letter-spacing: .5px; font-weight: 800; }
+.tree-inspector p { font-size: 10px; line-height: 1.6; color: #7f99b1; margin: 7px 0 0; }
+.tree-empty { color: #7893aa; font-size: 12px; text-align: center; padding: 27px; margin-top: 15px; border: 1px dashed #2e4558; border-radius: 7px; }
