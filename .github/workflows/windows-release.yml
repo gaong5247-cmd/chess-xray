@@ -1,0 +1,51 @@
+name: Chess X-Ray Windows release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: chess-xray-release
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Install frontend dependencies
+        run: npm install --no-audit --no-fund
+      - name: Generate Windows application icon
+        run: npm run prepare:icons
+      - name: Fetch official Stockfish 19 universal engine
+        run: npm run prepare:engine
+      - name: TypeScript check and Vite build
+        run: npm run build:web
+      - name: Build installer and publish GitHub release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: Chess X-Ray v__VERSION__
+          releaseBody: |
+            Chess X-Ray for Windows (Tauri 2 / Rust)
+            Includes offline Stockfish 19 universal and its GPL license.
+            MultiPV, legal analysis mini-boards, move arrows, UCI search
+            metrics, local engine matches and a clearly labeled Elo board.
+            This is an early release; local Elo estimates are not official CCRL.
+          releaseDraft: false
+          prerelease: false
+          args: --bundles nsis,msi

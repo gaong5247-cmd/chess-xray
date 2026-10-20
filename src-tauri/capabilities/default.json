@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "description": "Main Chess X-Ray window",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open"
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Chess X-Ray",
+  "version": "0.1.0",
+  "identifier": "io.github.gaong5247cmd.chessxray",
+  "build": {
+    "beforeDevCommand": "npm run dev:web",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build:web",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Chess X-Ray | Engine Observatory",
+        "width": 1640,
+        "height": 1010,
+        "minWidth": 1180,
+        "minHeight": 720,
+        "backgroundColor": "#090f1a",
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis",
+      "msi"
+    ],
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "resources/stockfish.exe": "stockfish/stockfish.exe",
+      "resources/LICENSE.Stockfish.txt": "stockfish/LICENSE.txt"
+    },
+    "shortDescription": "Native UCI engine analysis and tournament observatory"
+  }
+}

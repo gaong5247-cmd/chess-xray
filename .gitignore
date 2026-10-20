@@ -1,0 +1,7 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/resources/stockfish.exe
+src-tauri/resources/LICENSE.Stockfish.txt
+*.log
+.DS_Store
