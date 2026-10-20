@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Chess } from 'chess.js';
+import appPackage from '../package.json';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -397,7 +398,7 @@ export default function App() {
           if (live) void stopEngines(); modeRef.current = 'arena'; setMode('arena');
         }}><Swords size={16} /> Engine Arena</button>
       </nav>
-      <div className="top-actions"><span className="version-pill">v0.1.0</span>
+      <div className="top-actions"><span className="version-pill">v{appPackage.version}</span>
         <span className={'live-pill' + (live ? ' live' : '')}><i /> {live ? 'LIVE SESSION' : 'STANDBY'}</span></div>
     </header>
 
