@@ -33,7 +33,7 @@ jobs:
         run: npm run prepare:engine
       - name: TypeScript check and Vite build
         run: npm run build:web
-      - name: Test opening books, time controls, exact game counts, and PV logic
+      - name: Test persistent tournament journal, PGN export, search modes and PV
         run: npm run test
       - name: Run Rust EPD parser unit tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
@@ -49,6 +49,7 @@ jobs:
             Includes offline Stockfish 19 universal and its GPL license.
             Dual independently resizable White/Black PV boards and real Fischer clocks.
             Infinite/untimed depth and node search, exact tournament game counts.
+            IndexedDB autosave, safe pause/recovery, PGN export and UCI session isolation.
             MultiPV, legal analysis mini-boards, move arrows, UCI search
             metrics, local engine matches and a clearly labeled Elo board.
             This is an early release; local Elo estimates are not official CCRL.

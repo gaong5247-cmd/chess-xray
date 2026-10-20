@@ -18,6 +18,13 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 struct UciLine {
     slot: String,
     line: String,
+    session: String,
+}
+
+#[derive(Serialize, Clone)]
+struct UciClosed {
+    slot: String,
+    session: String,
 }
 struct RunningEngine {
     child: Child,
@@ -65,10 +72,14 @@ fn bundled_engine_available(app: tauri::AppHandle) -> bool {
 fn launch_engine(
     slot: String,
     path: String,
+    session: String,
     app: tauri::AppHandle,
     state: tauri::State<'_, EngineState>,
 ) -> Result<(), String> {
     assert_slot(&slot)?;
+    if session.is_empty() || session.len() > 128 || !session.is_ascii() {
+        return Err("Invalid UCI engine session token".into());
+    }
     let executable = engine_path(&app, &path)?;
     if !executable.is_file() {
         return Err(format!("Engine missing: {}", executable.display()));
@@ -91,25 +102,36 @@ fn launch_engine(
 
     let out_app = app.clone();
     let out_slot = slot.clone();
+    let out_session = session.clone();
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             match line {
-                Ok(line) => { let _ = out_app.emit("uci-line", UciLine { slot: out_slot.clone(), line }); }
+                Ok(line) => { let _ = out_app.emit("uci-line", UciLine {
+                    slot: out_slot.clone(), line, session: out_session.clone()
+                }); }
                 Err(_) => break,
             }
         }
-        let _ = out_app.emit("uci-closed", out_slot);
+        let _ = out_app.emit("uci-closed", UciClosed {
+            slot: out_slot, session: out_session
+        });
     });
     let err_app = app.clone();
     let err_slot = slot.clone();
+    let err_session = session.clone();
     thread::spawn(move || {
         for line in BufReader::new(stderr).lines().take(1000) {
             if let Ok(line) = line {
-                let _ = err_app.emit("uci-stderr", UciLine { slot: err_slot.clone(), line });
+                let _ = err_app.emit("uci-stderr", UciLine {
+                    slot: err_slot.clone(), line, session: err_session.clone()
+                });
             } else { break; }
         }
     });
-    send_impl(&state, &slot, "uci")?;
+    if let Err(error) = send_impl(&state, &slot, "uci") {
+        let _ = stop_impl(&state, &slot);
+        return Err(error);
+    }
     Ok(())
 }
 // Kept as a separate function for unit-level validation of UCI inputs.
@@ -272,12 +294,32 @@ mod epd_tests {
     }
 }
 
+/// Explicit user-selected PGN export. Paths are selected using the native
+/// save-file dialog; only .pgn targets are accepted.
+#[tauri::command]
+fn save_pgn_file(path: String, pgn: String) -> Result<(), String> {
+    const MAX_BYTES: usize = 250 * 1024 * 1024;
+    if pgn.len() > MAX_BYTES {
+        return Err("PGN export exceeds 250 MiB limit".into());
+    }
+    let target = PathBuf::from(path);
+    if !target.is_absolute() {
+        return Err("Choose an absolute file path using the save dialog".into());
+    }
+    if !target.extension().and_then(|s| s.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pgn")) {
+        return Err("Tournament export must have a .pgn extension".into());
+    }
+    std::fs::write(&target, pgn)
+        .map_err(|err| format!("Could not export PGN: {err}"))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(EngineState::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            bundled_engine_available, launch_engine, send_uci, stop_engine, load_epd_book
+            bundled_engine_available, launch_engine, send_uci, stop_engine, load_epd_book, save_pgn_file
         ])
         .run(tauri::generate_context!())
         .expect("failed to start Chess X-Ray");

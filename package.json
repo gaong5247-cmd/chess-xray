@@ -1,7 +1,7 @@
 {
   "name": "chess-xray",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "dev:web": "vite --host 127.0.0.1 --port 1420",
@@ -29,6 +29,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "~5.8.3",
     "vite": "^6.1.0",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "fake-indexeddb": "^6.0.1"
   }
 }

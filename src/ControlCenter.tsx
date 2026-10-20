@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   Activity, Check, ChevronRight, Cpu, FolderPlus, Gauge, LayoutGrid,
   Pause, Play, RotateCcw, Settings2, SlidersHorizontal,
-  Swords, Trash2, Trophy, X, BookOpen, FileText, RefreshCcw
+  Swords, Trash2, Trophy, X, BookOpen, FileText, RefreshCcw, Download
 } from 'lucide-react';
 import type { EngineEntry, UciOption } from './engines';
 import type { EpdBook, OpeningMode } from './epd';
@@ -72,6 +72,7 @@ type ControlProps = {
   onPauseTournament: () => Promise<void>;
   onResumeTournament: () => Promise<void>;
   onStopTournament: () => Promise<void>;
+  onExportTournament: () => Promise<void>;
   onStopAndPlay: () => Promise<void>;
 };
 
@@ -118,7 +119,7 @@ export default function ControlCenter(props: ControlProps) {
     tab, onTab, onClose, layout, onLayout, engines, onAddEngine,
     onRemoveEngine, onRenameEngine, onInspectEngine, inspectingId,
     onOption, onAssign, tournament, onStartTournament,
-    onPauseTournament, onResumeTournament, onStopTournament, onStopAndPlay,
+    onPauseTournament, onResumeTournament, onStopTournament, onStopAndPlay, onExportTournament,
     epdBook, epdLoading, epdError, openingMode, onOpeningMode,
     pairBookColors, onPairBookColors, onChooseEpdBook, onReloadEpdBook, onClearEpdBook
   } = props;
@@ -265,6 +266,9 @@ export default function ControlCenter(props: ControlProps) {
                 <strong>{tournament.status.toUpperCase()} · {Math.min(tournament.index, tournament.schedule.length)} / {tournament.schedule.length} games finished</strong>
               </div><div className="event-progress"><span style={{width: (100 * tournament.index / Math.max(1, tournament.schedule.length)) + '%'}}/></div>
               <div className="event-actions">
+                <button disabled={tournament.index === 0} onClick={() => void onExportTournament()}>
+                  <Download size={14} /> Export PGN
+                </button>
                 {tournament.status === 'running' && needsManualStop(tournament.timeControl || DEFAULT_TIME_CONTROL) &&
                   <button onClick={() => void onStopAndPlay()}><Play size={14}/> Stop &amp; play move</button>}
                 {tournament.status === 'running' && <button onClick={() => void onPauseTournament()}><Pause size={14}/> Pause</button>}
@@ -272,6 +276,11 @@ export default function ControlCenter(props: ControlProps) {
                 {(tournament.status === 'running' || tournament.status === 'paused') &&
                   <button className="danger-control-button" onClick={() => void onStopTournament()}>End event</button>}
               </div>
+              <p className="saved-tournament-note">
+                LOCAL AUTOSAVE · Schedule and completed results are journaled to IndexedDB.
+                Current moves and clocks are checkpointed. On reopening, an interrupted
+                tournament is restored PAUSED rather than playing unattended.
+              </p>
             </div>}
             <div className="opening-book-panel">
               <div className="opening-book-title">

@@ -3,7 +3,7 @@ import { Chess } from 'chess.js';
 import appPackage from '../package.json';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import { open } from '@tauri-apps/plugin-dialog';
+import { open, save } from '@tauri-apps/plugin-dialog';
 import {
   Activity, ArrowLeftRight, BarChart3, ChevronRight, CircleHelp, ClipboardCopy,
   Cpu, Download, Eye, FileInput, FolderOpen, Gauge, GitBranch, HardDrive,
@@ -15,6 +15,11 @@ import { assignOpeningPositions, makeEpdBook, type EpdBook, type EpdBookSample, 
 import Timeline, { type Metric, type Sample } from './Timeline';
 import SearchTree from './SearchTree';
 import PvBoards, { type PvBoardGroupProps } from './PvBoards';
+import {
+  startSavedTournament, recoverSavedTournament, saveCurrentGame,
+  finishSavedGame, saveTournamentStatus, tournamentToPgn,
+  type GameSnapshot
+} from './tournamentStorage';
 import {
   DEFAULT_TIME_CONTROL, buildGoCommand, formatClock, needsManualStop,
   newGameClocks, sanitizeTimeControl, timeSpent, type ClockTimes, type TimeControl
@@ -39,7 +44,9 @@ import {
 
 type Mode = 'analysis' | 'arena' | 'tournament';
 type ArrowMode = 'off' | 'best' | 'top3' | 'hikaru';
-type Packet = { slot: Slot | 'inspect'; line: string };
+type EngineSlot = Slot | 'inspect';
+type Packet = { slot: EngineSlot; line: string; session: string };
+type ClosedPacket = { slot: EngineSlot; session: string };
 type SlotMap<T> = Record<Slot, T>;
 const slots: Slot[] = ['white', 'black'];
 const START = new Chess().fen();
@@ -126,6 +133,12 @@ export default function App() {
   const [tournament, setTournament] = useState<TournamentRun | null>(null);
   const tournamentRef = useRef<TournamentRun | null>(null);
   const nextTournamentGameRef = useRef<((resume: boolean) => Promise<void>) | null>(null);
+  const snapshotQueue = useRef<Promise<void>>(Promise.resolve());
+  const sessionsRef = useRef<Record<EngineSlot, string | null>>({
+    white: null, black: null, inspect: null
+  });
+  const crashPauseRef = useRef<(() => Promise<void>) | null>(null);
+  const [journalError, setJournalError] = useState<string | null>(null);
   const clockRemainingRef = useRef<ClockTimes>(newGameClocks(DEFAULT_TIME_CONTROL));
   const [clockDisplay, setClockDisplay] = useState<ClockTimes>(newGameClocks(DEFAULT_TIME_CONTROL));
   const thinkingStartRef = useRef<{ slot: Slot; startedAt: number } | null>(null);
@@ -199,11 +212,82 @@ export default function App() {
     setNotice('EPD BOOK CLEARED · Tournament games will use the standard starting position.');
   };
 
+  // Interrupted tournaments are never auto-started after an app restart.
+  // Rehydrate the board and clocks, then leave the event safely PAUSED.
+  useEffect(() => {
+    let disposed = false;
+    void recoverSavedTournament().then(recovered => {
+      if (!recovered || disposed || tournamentRef.current) return;
+      const { run, snapshot, interrupted } = recovered;
+      let restored = new Chess(snapshot?.initialFen ||
+        run.schedule[run.index]?.openingFen || START);
+      if (snapshot) {
+        try {
+          for (const uci of snapshot.moves) {
+            const move = fromUci(uci);
+            if (!move || !restored.move(move)) throw new Error('Invalid saved UCI move: ' + uci);
+          }
+        } catch (error) {
+          setJournalError('Partial game recovery failed: ' + String(error));
+          restored = new Chess(run.schedule[run.index]?.openingFen || START);
+        }
+        clockRemainingRef.current = { ...snapshot.clocks };
+        setClockDisplay({ ...snapshot.clocks });
+      } else {
+        clockRemainingRef.current = newGameClocks(run.timeControl || DEFAULT_TIME_CONTROL);
+        setClockDisplay({ ...clockRemainingRef.current });
+      }
+      chess.current = restored;
+      setFen(restored.fen());
+      setFenInput(restored.fen());
+      setMoveSan(restored.history());
+      const history = restored.history({ verbose: true });
+      setLastMove(history.length
+        ? [history[history.length - 1].from, history[history.length - 1].to] : null);
+      tournamentRef.current = run;
+      setTournament(run);
+      modeRef.current = 'tournament';
+      setMode('tournament');
+      const pairing = run.schedule[run.index];
+      if (pairing) {
+        const white = enginesRef.current.find(e => e.id === pairing.whiteId);
+        const black = enginesRef.current.find(e => e.id === pairing.blackId);
+        if (white && black) {
+          assignedRef.current = { white: white.id, black: black.id };
+          const restoredPaths = { white: white.path, black: black.path };
+          pathsRef.current = restoredPaths;
+          namesRef.current = { white: white.name, black: black.name };
+          setPaths(restoredPaths);
+          setNames(namesRef.current);
+        }
+      }
+      setNotice('RECOVERED LOCAL TOURNAMENT · Game ' + (run.index + 1) +
+        '/' + run.schedule.length + ' · ' + run.status.toUpperCase() +
+        '. Select Tournament → Resume to continue.');
+      if (interrupted) void saveTournamentStatus(run)
+        .catch(error => setJournalError('Could not mark recovered event as paused: ' + String(error)));
+    }).catch(error => {
+      if (!disposed) setJournalError('Cannot read saved tournament: ' + String(error));
+    });
+    return () => { disposed = true; };
+  }, []);
+
   const send = useCallback(async (slot: Slot, command: string) => {
     try {
       await invoke('send_uci', { slot, command });
     } catch (error) {
       setNotice('UCI ERROR · ' + String(error));
+    }
+  }, []);
+
+  const launchEngine = useCallback(async (slot: EngineSlot, path: string) => {
+    const session = crypto.randomUUID();
+    sessionsRef.current[slot] = session;
+    try {
+      await invoke('launch_engine', { slot, path, session });
+    } catch (error) {
+      if (sessionsRef.current[slot] === session) sessionsRef.current[slot] = null;
+      throw error;
     }
   }, []);
 
@@ -221,6 +305,8 @@ export default function App() {
     analysisStarted.current = { white: false, black: false };
     setLive(false);
     readyRef.current = { white: false, black: false };
+    sessionsRef.current.white = null;
+    sessionsRef.current.black = null;
     setReady({ white: false, black: false });
     await Promise.all(slots.map(async slot => {
       try { await invoke('stop_engine', { slot }); } catch { /* engine not active */ }
@@ -261,6 +347,36 @@ export default function App() {
     await send(slot, think);
   }, [send, setSearchOrigin]);
 
+  const captureSnapshot = useCallback((run: TournamentRun): GameSnapshot | null => {
+    const gameInfo = run.schedule[run.index];
+    if (!gameInfo) return null;
+    return {
+      id: run.id,
+      number: gameInfo.number,
+      initialFen: gameInfo.openingFen || START,
+      moves: chess.current.history({ verbose: true }).map(move =>
+        move.from + move.to + (move.promotion || '')),
+      clocks: { ...clockRemainingRef.current },
+      savedAt: Date.now()
+    };
+  }, []);
+
+  const journalCurrentMove = useCallback(() => {
+    const run = tournamentRef.current;
+    if (modeRef.current !== 'tournament' || run?.status !== 'running') return;
+    const snapshot = captureSnapshot(run);
+    if (!snapshot) return;
+    // Serialize the writes to ensure a slow write for ply 15 cannot overwrite
+    // a newer saved ply 16 after sudden app shutdown.
+    snapshotQueue.current = snapshotQueue.current
+      .catch(() => {})
+      .then(() => saveCurrentGame(snapshot));
+    void snapshotQueue.current.catch(error => {
+      setJournalError('Automatic game checkpoint failed: ' + String(error));
+      setNotice('AUTO-SAVE ERROR · ' + String(error));
+    });
+  }, [captureSnapshot]);
+
   const commitMove = useCallback((from: string, to: string, promotion = 'q') => {
     try {
       const move = chess.current.move({ from, to, promotion });
@@ -269,11 +385,12 @@ export default function App() {
       setFenInput(chess.current.fen());
       setMoveSan(chess.current.history());
       setLastMove([from, to]);
+      journalCurrentMove();
       // Keep the most recently-searched PV for each side, anchored to its
       // original FEN, instead of erasing both on every tournament move.
       return true;
     } catch { return false; }
-  }, []);
+  }, [journalCurrentMove]);
 
   const finishArena = useCallback((moveCap = false, timeoutLoser?: Slot) => {
     if (!liveRef.current) return;
@@ -294,37 +411,64 @@ export default function App() {
     setManualMovePending(false);
     liveRef.current = false;
     setLive(false);
-    const next = recordResult(loadStandings(), namesRef.current.white, namesRef.current.black, whitePoints);
-    saveStandings(next);
-    setStandings(next);
     slots.forEach(slot => { void send(slot, 'stop'); });
     const running = tournamentRef.current;
+    const whiteName = namesRef.current.white;
+    const blackName = namesRef.current.black;
     if (modeRef.current === 'tournament' && running && running.status === 'running') {
       const index = running.index;
-      const schedule = running.schedule.map((item, idx) =>
-        idx === index ? { ...item, outcome, termination: label, pgn: game.pgn() } : item);
-      const finished = index + 1 >= schedule.length;
+      const gameRecord = {
+        ...running.schedule[index], outcome, termination: label, pgn: game.pgn()
+      };
+      // For very large tournaments, modify only one schedule slot rather
+      // than copying/mapping a 50,000-element array every finished game.
+      running.schedule[index] = gameRecord;
+      const finished = index + 1 >= running.schedule.length;
       const updated: TournamentRun = {
-        ...running, index: index + 1, schedule, status: finished ? 'completed' : 'running'
+        ...running, index: index + 1,
+        status: finished ? 'completed' : 'running'
       };
       tournamentRef.current = updated;
       setTournament(updated);
-      setNotice(finished
-        ? 'TOURNAMENT COMPLETED · ' + updated.schedule.length + ' games finished and rated.'
-        : 'TOURNAMENT · Game ' + (index + 1) + ' finished (' + outcome + '). Advancing to next pairing.');
-      if (!finished) window.setTimeout(() => {
-        const current = tournamentRef.current;
-        if (current?.status === 'running' && current.index === index + 1) {
-          void nextTournamentGameRef.current?.(false);
-        }
-      }, 350);
+      setNotice('SAVING FINISHED GAME · ' + gameRecord.number + '/' +
+        updated.schedule.length + ' · ' + outcome);
+      void snapshotQueue.current.catch(() => {})
+        .then(() => finishSavedGame(updated, gameRecord))
+        .then(() => {
+          const ranks = recordResult(loadStandings(), whiteName, blackName, whitePoints);
+          saveStandings(ranks);
+          setStandings(ranks);
+          setNotice(finished
+            ? 'TOURNAMENT COMPLETE · ' + updated.schedule.length + ' games safely saved.'
+            : 'SAVED GAME ' + (index + 1) + '/' + updated.schedule.length +
+              ' · ' + outcome + ' · Next pairing ready.');
+          if (!finished) window.setTimeout(() => {
+            const current = tournamentRef.current;
+            if (current?.status === 'running' && current.index === index + 1) {
+              void nextTournamentGameRef.current?.(false);
+            }
+          }, 350);
+        })
+        .catch(error => {
+          // Never start the next pairing if the finished result was not
+          // journaled. Preserve the current board so the PGN is still copyable.
+          const paused: TournamentRun = { ...updated, status: 'paused' };
+          tournamentRef.current = paused;
+          setTournament(paused);
+          setJournalError('Finished game could not be journaled: ' + String(error));
+          setNotice('TOURNAMENT HALTED · Save failed, inspect storage before continuing.');
+        });
     } else {
+      const ranks = recordResult(loadStandings(), whiteName, blackName, whitePoints);
+      saveStandings(ranks);
+      setStandings(ranks);
       setNotice(label + ' · Game recorded in local standings.');
     }
   }, [send]);
 
   const handleLine = useCallback((packet: Packet) => {
-    const { slot, line } = packet;
+    const { slot, line, session } = packet;
+    if (sessionsRef.current[slot] !== session) return;
     if (slot === 'inspect') {
       const id = inspectingRef.current;
       if (!id) return;
@@ -335,6 +479,7 @@ export default function App() {
         return { ...engine, availableOptions: [...options, parsed] };
       }));
       if (line === 'uciok') {
+        sessionsRef.current.inspect = null;
         inspectingRef.current = null;
         setInspectingId(null);
         setNotice('UCI INSPECTION COMPLETED · Available engine options have been saved.');
@@ -466,8 +611,10 @@ export default function App() {
     let cancelled = false;
     Promise.all([
       listen<Packet>('uci-line', event => handleLine(event.payload)),
-      listen<Slot | 'inspect'>('uci-closed', event => {
-        const slot = event.payload;
+      listen<ClosedPacket>('uci-closed', event => {
+        const { slot, session } = event.payload;
+        if (sessionsRef.current[slot] !== session) return;
+        sessionsRef.current[slot] = null;
         if (slot === 'inspect') {
           if (inspectingRef.current) setNotice('UCI INSPECTION CLOSED before engine handshake completed.');
           inspectingRef.current = null;
@@ -476,8 +623,16 @@ export default function App() {
         }
         readyRef.current = { ...readyRef.current, [slot]: false };
         setReady({ ...readyRef.current });
+        if (liveRef.current && modeRef.current === 'tournament' &&
+            tournamentRef.current?.status === 'running') {
+          setNotice('ENGINE DISCONNECTED · Pausing and saving current tournament game.');
+          void crashPauseRef.current?.().catch(error => {
+            setJournalError('Could not pause after engine exit: ' + String(error));
+          });
+        }
       }),
       listen<Packet>('uci-stderr', event => {
+        if (sessionsRef.current[event.payload.slot] !== event.payload.session) return;
         setLines(prev => [event.payload.slot.toUpperCase() + ' [stderr] ' + event.payload.line, ...prev].slice(0, 85));
       })
     ]).then(fns => { if (cancelled) fns.forEach(fn => fn()); else unlisten.push(...fns); })
@@ -518,7 +673,7 @@ export default function App() {
     setNotice('CONNECTING · Starting both White and Black UCI analysis engines…');
     try {
       await Promise.all(slots.map(slot =>
-        invoke('launch_engine', { slot, path: pathsRef.current[slot] })));
+        launchEngine(slot, pathsRef.current[slot])));
     } catch (error) {
       await stopEngines();
       setNotice('DUAL ANALYSIS START FAILED · ' + String(error));
@@ -539,7 +694,7 @@ export default function App() {
     setNotice('ARENA LIVE · Starting two independent UCI processes…');
     try {
       await Promise.all(slots.map(slot =>
-        invoke('launch_engine', { slot, path: pathsRef.current[slot] })));
+        launchEngine(slot, pathsRef.current[slot])));
     } catch (error) {
       setNotice('MATCH START FAILED · ' + String(error));
       await stopEngines();
@@ -588,9 +743,11 @@ export default function App() {
       + (pairing.openingFen ? ' · EPD book position' : ' · Standard start')
       + (resume ? ' (resumed)' : ''));
     try {
-      await Promise.all(slots.map(slot => invoke('launch_engine', {
-        slot, path: selectedPaths[slot]
-      })));
+      if (!resume) {
+        const snapshot = captureSnapshot(current);
+        if (snapshot) await saveCurrentGame(snapshot);
+      }
+      await Promise.all(slots.map(slot => launchEngine(slot, selectedPaths[slot])));
     } catch (error) {
       const prior = tournamentRef.current;
       if (prior) {
@@ -598,7 +755,10 @@ export default function App() {
         setTournament(tournamentRef.current);
       }
       await stopEngines();
-      setNotice('TOURNAMENT PAUSED · Engine launch failed: ' + String(error));
+      const paused = tournamentRef.current;
+      if (paused) void saveTournamentStatus(paused).catch(storageErr =>
+        setJournalError('Could not save paused tournament status: ' + String(storageErr)));
+      setNotice('TOURNAMENT PAUSED · Engine launch or checkpoint failed: ' + String(error));
     }
   };
   nextTournamentGameRef.current = launchTournamentGame;
@@ -627,13 +787,21 @@ export default function App() {
       timeControl: sanitizeTimeControl(settings.timeControl || DEFAULT_TIME_CONTROL),
       openingBookName: openingMode === 'epd' ? epdBook?.name : undefined
     };
+    // Durable event creation must finish before the first engine is launched.
+    await snapshotQueue.current.catch(() => {});
+    await startSavedTournament(run);
+    snapshotQueue.current = Promise.resolve();
     tournamentRef.current = run;
+    setJournalError(null);
     setTournament(run);
     await launchTournamentGame(false);
   };
   const pauseTournament = async (): Promise<void> => {
     const run = tournamentRef.current;
     if (!run || run.status !== 'running') return;
+    // A completed game may be committing its result between pairings.
+    // Do not checkpoint that final position as the next game's moves.
+    const gameWasActive = liveRef.current || thinkingStartRef.current !== null;
     if (run.timeControl?.mode === 'clock' && thinkingStartRef.current) {
       const { slot, startedAt } = thinkingStartRef.current;
       const elapsed = performance.now() - startedAt;
@@ -646,13 +814,27 @@ export default function App() {
     tournamentRef.current = { ...run, status: 'paused' };
     setTournament(tournamentRef.current);
     await stopEngines();
-    setNotice('TOURNAMENT PAUSED · Resume restores the remaining clock time and current FEN.');
+    try {
+      await snapshotQueue.current.catch(() => {});
+      if (gameWasActive) {
+        const checkpoint = captureSnapshot(tournamentRef.current!);
+        if (checkpoint) await saveCurrentGame(checkpoint);
+      }
+      await saveTournamentStatus(tournamentRef.current!);
+      setNotice('TOURNAMENT PAUSED & SAVED · Resume restores the position and clocks.');
+    } catch (error) {
+      setJournalError('Cannot persist pause checkpoint: ' + String(error));
+      setNotice('PAUSED BUT NOT SAVED · ' + String(error));
+    }
   };
+  crashPauseRef.current = pauseTournament;
   const resumeTournament = async (): Promise<void> => {
     const run = tournamentRef.current;
     if (!run || run.status !== 'paused') return;
-    tournamentRef.current = { ...run, status: 'running' };
-    setTournament(tournamentRef.current);
+    const resumed: TournamentRun = { ...run, status: 'running' };
+    await saveTournamentStatus(resumed);
+    tournamentRef.current = resumed;
+    setTournament(resumed);
     await launchTournamentGame(true);
   };
   const stopAndPlay = async (): Promise<void> => {
@@ -664,14 +846,46 @@ export default function App() {
     setNotice('UNTIMED SEARCH · Sending stop, awaiting bestmove from the active engine…');
     await send(searching.current, 'stop');
   };
+  const exportTournament = async (): Promise<void> => {
+    const run = tournamentRef.current;
+    if (!run || run.index === 0) {
+      setNotice('PGN EXPORT · Complete at least one game before exporting.');
+      return;
+    }
+    try {
+      const selected = await save({
+        defaultPath: 'Chess-XRay-' + run.id + '.pgn',
+        filters: [{ name: 'PGN chess games', extensions: ['pgn'] }]
+      });
+      if (typeof selected !== 'string') return;
+      const pgn = tournamentToPgn(run, enginesRef.current);
+      await invoke('save_pgn_file', { path: selected, pgn });
+      setNotice('PGN EXPORTED · ' + run.index + ' completed games written to ' + selected);
+    } catch (error) {
+      setNotice('PGN EXPORT FAILED · ' + String(error));
+    }
+  };
   const stopTournament = async (): Promise<void> => {
+    const gameWasActive = liveRef.current || thinkingStartRef.current !== null;
     const run = tournamentRef.current;
     if (run) {
       tournamentRef.current = { ...run, status: 'stopped' };
       setTournament(tournamentRef.current);
     }
     await stopEngines();
-    setNotice('TOURNAMENT STOPPED · Finished games remain in the local rating table.');
+    if (tournamentRef.current) {
+      try {
+        await snapshotQueue.current.catch(() => {});
+        if (gameWasActive) {
+          const checkpoint = captureSnapshot(tournamentRef.current);
+          if (checkpoint) await saveCurrentGame(checkpoint);
+        }
+        await saveTournamentStatus(tournamentRef.current);
+      } catch (error) {
+        setJournalError('Cannot persist stopped event: ' + String(error));
+      }
+    }
+    setNotice('TOURNAMENT STOPPED · Recorded games remain in the persistent journal.');
   };
   const switchMode = async (next: 'analysis' | 'arena') => {
     if (tournamentRef.current?.status === 'running') await pauseTournament();
@@ -724,7 +938,7 @@ export default function App() {
     setEngines(enginesRef.current);
     setNotice('READING UCI OPTIONS · ' + entry.name);
     try {
-      await invoke('launch_engine', { slot: 'inspect', path: entry.path });
+      await launchEngine('inspect', entry.path);
     } catch (error) {
       inspectingRef.current = null;
       setInspectingId(null);
@@ -935,7 +1149,11 @@ export default function App() {
               if (mode === 'tournament') setControlTab('tournament');
               else void (mode === 'analysis' ? startAnalysis() : startArena());
             }}><Play size={16} fill="currentColor" /> {mode === 'analysis' ? 'START ANALYSIS' : mode === 'arena' ? 'START MATCH' : 'TOURNAMENT CONTROL'}</button>
-            <button className="secondary-action" onClick={() => void stopEngines()} disabled={!live}><Pause size={16} /> Stop engines</button>
+            <button className="secondary-action" onClick={() => {
+              if (mode === 'tournament' && tournamentRef.current?.status === 'running') {
+                void pauseTournament();
+              } else void stopEngines();
+            }} disabled={!live}><Pause size={16} /> {mode === 'tournament' ? 'Pause & save event' : 'Stop engines'}</button>
             {mode === 'tournament' && tournament?.status === 'running' &&
               needsManualStop(tournament.timeControl || DEFAULT_TIME_CONTROL) &&
               <button className="manual-bestmove-button" disabled={!searching.current || manualMovePending}
@@ -974,7 +1192,8 @@ export default function App() {
           <div className="title-actions">
             <button onClick={() => setFlipped(f => !f)}><ArrowLeftRight size={16} /> Flip board</button>
             <button onClick={() => {
-              if (mode === 'tournament' && tournamentRef.current?.status === 'running') {
+              if (mode === 'tournament' &&
+                ['running', 'paused'].includes(tournamentRef.current?.status || '')) {
                 setControlTab('tournament');
                 return;
               }
@@ -1121,6 +1340,12 @@ export default function App() {
         <PvBoards {...pvBoardProps} expanded />
       </section>
     </div>}
+
+    {journalError && <div className="journal-error-banner" role="alert">
+      <strong>LOCAL JOURNAL ERROR</strong>
+      <span>{journalError}</span>
+      <button onClick={() => setJournalError(null)} aria-label="Dismiss journal warning">Dismiss</button>
+    </div>}
     {controlTab && <ControlCenter
       tab={controlTab} onTab={setControlTab} onClose={() => setControlTab(null)}
       layout={layout} onLayout={setLayout} engines={engines}
@@ -1134,7 +1359,8 @@ export default function App() {
       onChooseEpdBook={chooseEpdBook} onReloadEpdBook={reloadEpdBook}
       onClearEpdBook={clearEpdBook} onStartTournament={startTournament}
       onPauseTournament={pauseTournament} onResumeTournament={resumeTournament}
-      onStopTournament={stopTournament} onStopAndPlay={stopAndPlay} />}
+      onStopTournament={stopTournament} onStopAndPlay={stopAndPlay}
+      onExportTournament={exportTournament} />}
     <footer className="statusbar"><span><i className={'status-dot' + (live ? ' active' : '')} />{notice}</span>
       <div><span>RUST / TAURI 2</span><span className="footer-sep">/</span><span>UCI NATIVE</span><span className="footer-sep">/</span><span><Download size={12} /> OFFLINE STOCKFISH 19</span></div></footer>
   </div>;

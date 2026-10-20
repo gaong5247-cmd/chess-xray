@@ -50,3 +50,15 @@ Detailed usage: [EPD opening books](docs/EPD_BOOKS.md) · [Demo positions](examp
 - Real clock mode uses UCI wtime/btime/winc/binc, displays both remaining clocks, deducts elapsed time, handles flag falls, and preserves clock time on pause/resume.
 
 See [dual PV and tournament search mode documentation](docs/DUAL_PV_AND_TIME_CONTROLS.md).
+
+## v0.5.0: Autosave, recovery and PGN export
+
+Chess X-Ray journals a tournament's **schedule once**, then saves **completed game results and the in-progress move list/remaining clocks** separately in local IndexedDB storage. This avoids rewriting tens of thousands of pairings every move.
+
+- Reopen the app after an interrupted tournament: the latest event restores in **PAUSED** state with its current chess position and remaining Fischer clocks. Select **Tournament → Resume current game** to restart the UCI engines.
+- **Tournament → Export PGN** opens a native file-save dialog and writes every completed game, with White/Black/Result headers and FEN/SetUp tags for EPD starts.
+- Rapid engine restarts are now guarded by per-process UCI session IDs; output or exit notifications from an earlier engine instance are discarded.
+- Unexpected engine exit during a running tournament pauses the event instead of letting its clock run indefinitely.
+- The test suite includes IndexedDB persistence/recovery, PGN formatting, time controls, EPD parsing and paired opening selection.
+
+Autosave remains **local to the Tauri app data/webview profile**. Removing app data or resetting the Windows profile can remove these records, so export PGN for long-term archives. Recovery is best-effort for the most recent journaled game; newly added persistence cannot recover old pre-v0.5 games that were never saved.
