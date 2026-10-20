@@ -52,8 +52,8 @@ fn engine_path(app: &tauri::AppHandle, input: &str) -> Result<PathBuf, String> {
     }
 }
 fn assert_slot(slot: &str) -> Result<(), String> {
-    if slot == "white" || slot == "black" { Ok(()) }
-    else { Err("Engine slot must be white or black".into()) }
+    if slot == "white" || slot == "black" || slot == "inspect" { Ok(()) }
+    else { Err("Engine slot must be white, black or inspect".into()) }
 }
 
 #[tauri::command]

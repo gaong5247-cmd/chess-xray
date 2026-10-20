@@ -1,23 +1,36 @@
-# Chess X-Ray
+# Chess X-Ray 0.2
 
-**Chess X-Ray** is an independent Windows chess engine analysis and match viewer, built with **Tauri 2 + Rust + React + TypeScript**.
+Windows desktop chess engine observatory built with Rust + Tauri 2 + React.
 
-The initial release combines a tournament-broadcast dashboard, UCI MultiPV analysis, principal-variation preview boards, configurable move arrows, an engine-vs-engine match controller, analysis timelines, and a local Elo leaderboard anchored to Stockfish 19 at **3650 on CCRL 40/15 (4 CPU, 2026-10-16)**.
+## Main application menus (top-left)
 
-> Rating note: the 3650 value is an external reference point, not proof that local games reproduce CCRL testing conditions. Local estimates are labeled separately.
+- **Configure**: individually adjustable main board size, PV panel width, PV preview board size and PV font size. Layout is saved locally. Board-first mode makes the chessboard the primary center-column element. Drag the grip beside the PV panel to resize it directly.
+- **Engines**: add UCI Windows EXE engines to a persistent library, rename entries, inspect actual UCI options, edit spin/check/combo/string option values, assign an engine as white or black.
+- **Tournament**: select multiple registered entrants, set tournament cycles, reversed-color legs, thinking time per move, and maximum ply count. Automatically run a round-robin series and see live schedule, tournament points, results and locally estimated Elo. Pause preserves the current FEN so the same game can be resumed with fresh engine processes.
 
-## Building
+## Analysis and board
 
-Install Node.js LTS, Rust, Microsoft C++ Build Tools, and WebView2 on Windows. Then:
+- Official, bundled Stockfish 19 x86-64 universal (GPLv3), fetched from the official upstream release during Windows builds.
+- MultiPV, interactive miniature chessboards after each candidate variation, SAN, legal FEN load, PGN copy, move-arrow overlay (including Hikaru mode), flip board, move input.
+- UCI depth, search nodes, NPS, hash occupancy, optional WDL, configurable graph types, local rankings, and a variation-prefix search tree.
+- Optional Stockless X-Ray instrumentation is documented in docs/INSTRUMENTATION.md. Missing TT hit rate and NNUE metrics are explicitly UNAVAILABLE rather than guessed.
 
-```powershell
-npm install
-npm run prepare:engine
-npm run desktop:dev
-```
+## Ratings
 
-To package an installer: `npm run desktop:build`. Windows GitHub Actions builds a release automatically when the project is pushed to the default branch.
+The reference is Stockfish 19 at CCRL 40/15, 4 CPU, 3650 Elo dated 2026-10-16. This is an external anchor, not an equivalent local benchmark. All other Elo values are provisional, locally estimated and distinct from official CCRL ratings.
 
-Bundled Stockfish is downloaded from the **official Stockfish 19 GitHub release** as part of the build. Stockfish is GPLv3; the installer includes upstream license text. Lichess Cburnett pieces are GPLv2+ and credited in `THIRD_PARTY_NOTICES.md`.
+## Installation
 
-Development will live in this repository, not in the existing Stockless engine source repository.
+Download Windows EXE or MSI from https://github.com/gaong5247-cmd/chess-xray/releases/latest
+
+## Build
+
+Requires Node.js 22+, Rust stable, Microsoft C++ Build Tools, WebView2.
+
+    npm install
+    npm run desktop:dev
+    npm run desktop:build
+
+Windows GitHub Actions builds NSIS and MSI and publishes a release when the main branch updates.
+
+License: GPL-3.0-or-later. Lichess Cburnett chess pieces GPL-2.0-or-later. Third-party notices are in THIRD_PARTY_NOTICES.md. Not affiliated with Stockfish, Lichess, TCEC, CCC or CCRL.

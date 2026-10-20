@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type CSSProperties } from 'react';
 import { Chess } from 'chess.js';
 import appPackage from '../package.json';
 import { invoke } from '@tauri-apps/api/core';
@@ -8,11 +8,21 @@ import {
   Activity, ArrowLeftRight, BarChart3, ChevronRight, CircleHelp, ClipboardCopy,
   Cpu, Download, Eye, FileInput, FolderOpen, Gauge, GitBranch, HardDrive,
   Layers3, Pause, Play, Radio, RotateCcw, Settings2, ShieldCheck, Swords,
-  Trophy, Zap
+  Trophy, Zap, SlidersHorizontal
 } from 'lucide-react';
 import { ChessBoard, type Arrow, type BoardTheme } from './ChessBoard';
 import Timeline, { type Metric, type Sample } from './Timeline';
 import SearchTree from './SearchTree';
+import ControlCenter, {
+  type ControlTab, loadLayout, persistLayout, clamp, type LayoutPrefs
+} from './ControlCenter';
+import {
+  type EngineEntry, BUILTIN_ID, loadEngines, saveEngines, parseOptionLine,
+  newEngineId, uniqueEngineName
+} from './engines';
+import {
+  createRoundRobin, type TournamentConfig, type TournamentRun, type GameOutcome
+} from './tournament';
 import {
   type Slot, type UciInfo, type XrayTelemetry,
   fromUci, legalPv, parseUciInfo, parseXrayTelemetry, scoreLabel, shortNumber, whiteEval
@@ -21,9 +31,9 @@ import {
   ANCHOR_NAME, ANCHOR_RATING, loadStandings, recordResult, saveStandings
 } from './elo';
 
-type Mode = 'analysis' | 'arena';
+type Mode = 'analysis' | 'arena' | 'tournament';
 type ArrowMode = 'off' | 'best' | 'top3' | 'hikaru';
-type Packet = { slot: Slot; line: string };
+type Packet = { slot: Slot | 'inspect'; line: string };
 type SlotMap<T> = Record<Slot, T>;
 const slots: Slot[] = ['white', 'black'];
 const START = new Chess().fen();
@@ -88,10 +98,25 @@ export default function App() {
   const [depth, setDepth] = useState(14);
   const [threads, setThreads] = useState(2);
   const [hash, setHash] = useState(128);
+  const [controlTab, setControlTab] = useState<ControlTab | null>(null);
+  const [layout, setLayout] = useState<LayoutPrefs>(loadLayout);
+  const [engines, setEngines] = useState<EngineEntry[]>(loadEngines);
+  const enginesRef = useRef<EngineEntry[]>(engines);
+  const assignedRef = useRef<SlotMap<string>>({ white: BUILTIN_ID, black: BUILTIN_ID });
+  const inspectingRef = useRef<string | null>(null);
+  const [inspectingId, setInspectingId] = useState<string | null>(null);
+  const [tournament, setTournament] = useState<TournamentRun | null>(null);
+  const tournamentRef = useRef<TournamentRun | null>(null);
+  const nextTournamentGameRef = useRef<((resume: boolean) => Promise<void>) | null>(null);
   const config = useRef({ multipv, depth, threads, hash });
   useEffect(() => { config.current = { multipv, depth, threads, hash }; }, [multipv, depth, threads, hash]);
   useEffect(() => { pathsRef.current = paths; localStorage.setItem('chess-xray-engine-paths', JSON.stringify(paths)); }, [paths]);
   useEffect(() => { namesRef.current = names; }, [names]);
+  useEffect(() => {
+    enginesRef.current = engines;
+    saveEngines(engines);
+  }, [engines]);
+  useEffect(() => { persistLayout(layout); }, [layout]);
 
   const send = useCallback(async (slot: Slot, command: string) => {
     try {
@@ -120,12 +145,15 @@ export default function App() {
   }, [send]);
 
   const requestArenaMove = useCallback(async () => {
-    if (!liveRef.current || modeRef.current !== 'arena') return;
+    if (!liveRef.current || !['arena', 'tournament'].includes(modeRef.current)) return;
     const slot: Slot = chess.current.turn() === 'w' ? 'white' : 'black';
     if (!readyRef.current[slot] || searching.current) return;
     searching.current = slot;
     await send(slot, 'position fen ' + chess.current.fen());
-    await send(slot, 'go depth ' + config.current.depth);
+    const think = modeRef.current === 'tournament' && tournamentRef.current
+      ? 'go movetime ' + tournamentRef.current.movetime
+      : 'go depth ' + config.current.depth;
+    await send(slot, think);
   }, [send]);
 
   const commitMove = useCallback((from: string, to: string, promotion = 'q') => {
@@ -136,31 +164,74 @@ export default function App() {
       setFenInput(chess.current.fen());
       setMoveSan(chess.current.history());
       setLastMove([from, to]);
+      setPvs({ white: [], black: [] });
+      setInfos({ white: undefined, black: undefined });
       return true;
     } catch { return false; }
   }, []);
 
-  const finishArena = useCallback(() => {
+  const finishArena = useCallback((moveCap = false) => {
     const game = chess.current;
     let whitePoints: 0 | 0.5 | 1 = 0.5;
-    if (game.isCheckmate()) whitePoints = game.turn() === 'w' ? 0 : 1;
-    const label = game.isCheckmate()
+    if (game.isCheckmate() && !moveCap) whitePoints = game.turn() === 'w' ? 0 : 1;
+    const label = game.isCheckmate() && !moveCap
       ? 'CHECKMATE · ' + (whitePoints === 1 ? 'WHITE WINS' : 'BLACK WINS')
+      : moveCap ? 'DRAW · MAX PLY LIMIT'
       : 'DRAW · ' + (game.isStalemate() ? 'STALEMATE' : 'REPETITION / RULE');
+    const outcome: GameOutcome = whitePoints === 1 ? '1-0' : whitePoints === 0 ? '0-1' : '1/2-1/2';
     setResult(label);
-    setNotice(label + ' · Game recorded in local standings.');
-    liveRef.current = false;
     searching.current = null;
+    liveRef.current = false;
     setLive(false);
     const next = recordResult(loadStandings(), namesRef.current.white, namesRef.current.black, whitePoints);
     saveStandings(next);
     setStandings(next);
     slots.forEach(slot => { void send(slot, 'stop'); });
+    const running = tournamentRef.current;
+    if (modeRef.current === 'tournament' && running && running.status === 'running') {
+      const index = running.index;
+      const schedule = running.schedule.map((item, idx) =>
+        idx === index ? { ...item, outcome, termination: label, pgn: game.pgn() } : item);
+      const finished = index + 1 >= schedule.length;
+      const updated: TournamentRun = {
+        ...running, index: index + 1, schedule, status: finished ? 'completed' : 'running'
+      };
+      tournamentRef.current = updated;
+      setTournament(updated);
+      setNotice(finished
+        ? 'TOURNAMENT COMPLETED · ' + updated.schedule.length + ' games finished and rated.'
+        : 'TOURNAMENT · Game ' + (index + 1) + ' finished (' + outcome + '). Advancing to next pairing.');
+      if (!finished) window.setTimeout(() => {
+        const current = tournamentRef.current;
+        if (current?.status === 'running' && current.index === index + 1) {
+          void nextTournamentGameRef.current?.(false);
+        }
+      }, 350);
+    } else {
+      setNotice(label + ' · Game recorded in local standings.');
+    }
   }, [send]);
 
   const handleLine = useCallback((packet: Packet) => {
     const { slot, line } = packet;
-    if (line.startsWith('id name ')) {
+    if (slot === 'inspect') {
+      const id = inspectingRef.current;
+      if (!id) return;
+      const parsed = parseOptionLine(line);
+      if (parsed) setEngines(previous => previous.map(engine => {
+        if (engine.id !== id) return engine;
+        const options = engine.availableOptions.filter(opt => opt.name !== parsed.name);
+        return { ...engine, availableOptions: [...options, parsed] };
+      }));
+      if (line === 'uciok') {
+        inspectingRef.current = null;
+        setInspectingId(null);
+        setNotice('UCI INSPECTION COMPLETED · Available engine options have been saved.');
+        void invoke('stop_engine', { slot: 'inspect' });
+      }
+      return;
+    }
+    if (modeRef.current !== 'tournament' && line.startsWith('id name ')) {
       const rawName = line.slice('id name '.length).trim();
       const name = /^Stockfish 19(\s|$)/i.test(rawName) ? ANCHOR_NAME : rawName;
       namesRef.current = { ...namesRef.current, [slot]: name };
@@ -172,6 +243,13 @@ export default function App() {
         await send(slot, 'setoption name Hash value ' + config.current.hash);
         await send(slot, 'setoption name MultiPV value ' +
           (modeRef.current === 'analysis' && slot === 'white' ? config.current.multipv : 1));
+        const entry = enginesRef.current.find(e => e.id === assignedRef.current[slot]);
+        if (entry) for (const [key, value] of Object.entries(entry.options)) {
+          if (!key.includes('\n') && !key.includes('\r') &&
+              !value.includes('\n') && !value.includes('\r')) {
+            await send(slot, 'setoption name ' + key + ' value ' + value);
+          }
+        }
         await send(slot, 'isready');
       })();
     }
@@ -180,7 +258,7 @@ export default function App() {
       setReady({ ...readyRef.current });
       if (liveRef.current && modeRef.current === 'analysis' && slot === 'white') {
         void searchAnalysis();
-      } else if (liveRef.current && modeRef.current === 'arena') {
+      } else if (liveRef.current && (modeRef.current === 'arena' || modeRef.current === 'tournament')) {
         void requestArenaMove();
       }
     }
@@ -207,7 +285,7 @@ export default function App() {
         });
       }
     }
-    if (line.startsWith('bestmove ') && modeRef.current === 'arena' &&
+    if (line.startsWith('bestmove ') && (modeRef.current === 'arena' || modeRef.current === 'tournament') &&
       liveRef.current && searching.current === slot) {
       searching.current = null;
       const move = fromUci(line.split(/\s+/)[1] || '');
@@ -217,7 +295,9 @@ export default function App() {
         setLive(false);
         return;
       }
-      if (chess.current.isGameOver()) finishArena();
+      const reachedLimit = modeRef.current === 'tournament' && tournamentRef.current !== null &&
+        chess.current.history().length >= tournamentRef.current.maxPlies;
+      if (chess.current.isGameOver() || reachedLimit) finishArena(reachedLimit);
       else void requestArenaMove();
     }
     if (line.startsWith('info ') || line.startsWith('bestmove ')) {
@@ -230,8 +310,14 @@ export default function App() {
     let cancelled = false;
     Promise.all([
       listen<Packet>('uci-line', event => handleLine(event.payload)),
-      listen<Slot>('uci-closed', event => {
+      listen<Slot | 'inspect'>('uci-closed', event => {
         const slot = event.payload;
+        if (slot === 'inspect') {
+          if (inspectingRef.current) setNotice('UCI INSPECTION CLOSED before engine handshake completed.');
+          inspectingRef.current = null;
+          setInspectingId(null);
+          return;
+        }
         readyRef.current = { ...readyRef.current, [slot]: false };
         setReady({ ...readyRef.current });
       }),
@@ -299,6 +385,176 @@ export default function App() {
       await stopEngines();
     }
   };
+  const launchTournamentGame = async (resume: boolean): Promise<void> => {
+    const current = tournamentRef.current;
+    if (!current || current.status !== 'running') return;
+    const pairing = current.schedule[current.index];
+    if (!pairing) return;
+    const whiteEntry = enginesRef.current.find(e => e.id === pairing.whiteId);
+    const blackEntry = enginesRef.current.find(e => e.id === pairing.blackId);
+    if (!whiteEntry || !blackEntry) {
+      tournamentRef.current = { ...current, status: 'paused' };
+      setTournament(tournamentRef.current);
+      setNotice('TOURNAMENT PAUSED · An entrant is missing from the engine library.');
+      return;
+    }
+    await stopEngines();
+    if (tournamentRef.current?.status !== 'running') return;
+    if (!resume) {
+      chess.current = new Chess();
+      setFen(START);
+      setFenInput(START);
+      setMoveSan([]);
+      setLastMove(null);
+    }
+    const selectedPaths = { white: whiteEntry.path, black: blackEntry.path };
+    const selectedNames = { white: whiteEntry.name, black: blackEntry.name };
+    pathsRef.current = selectedPaths;
+    namesRef.current = selectedNames;
+    assignedRef.current = { white: whiteEntry.id, black: blackEntry.id };
+    setPaths(selectedPaths);
+    setNames(selectedNames);
+    clearTelemetry();
+    modeRef.current = 'tournament';
+    setMode('tournament');
+    searching.current = null;
+    liveRef.current = true;
+    setLive(true);
+    setNotice('TOURNAMENT LIVE · Game ' + pairing.number + '/' + current.schedule.length
+      + ' · ' + whiteEntry.name + ' vs ' + blackEntry.name + (resume ? ' (resumed)' : ''));
+    try {
+      await Promise.all(slots.map(slot => invoke('launch_engine', {
+        slot, path: selectedPaths[slot]
+      })));
+    } catch (error) {
+      const prior = tournamentRef.current;
+      if (prior) {
+        tournamentRef.current = { ...prior, status: 'paused' };
+        setTournament(tournamentRef.current);
+      }
+      await stopEngines();
+      setNotice('TOURNAMENT PAUSED · Engine launch failed: ' + String(error));
+    }
+  };
+  nextTournamentGameRef.current = launchTournamentGame;
+
+  const startTournament = async (settings: TournamentConfig): Promise<void> => {
+    const unique = [...new Set(settings.entrants)];
+    if (unique.length < 2) throw new Error('Add and select at least 2 different engines.');
+    if (unique.some(id => !enginesRef.current.some(engine => engine.id === id))) {
+      throw new Error('Every tournament participant must exist in the Engines library.');
+    }
+    const schedule = createRoundRobin({ ...settings, entrants: unique });
+    if (!schedule.length) throw new Error('Could not generate a tournament schedule.');
+    await stopEngines();
+    const run: TournamentRun = {
+      id: 'event-' + Date.now(), name: 'Chess X-Ray Round Robin',
+      entries: unique, schedule, index: 0, status: 'running',
+      movetime: clamp(settings.movetime, 100, 60000),
+      maxPlies: clamp(settings.maxPlies, 40, 600)
+    };
+    tournamentRef.current = run;
+    setTournament(run);
+    await launchTournamentGame(false);
+  };
+  const pauseTournament = async (): Promise<void> => {
+    const run = tournamentRef.current;
+    if (!run || run.status !== 'running') return;
+    tournamentRef.current = { ...run, status: 'paused' };
+    setTournament(tournamentRef.current);
+    await stopEngines();
+    setNotice('TOURNAMENT PAUSED · Resume will restart engines from the current board position.');
+  };
+  const resumeTournament = async (): Promise<void> => {
+    const run = tournamentRef.current;
+    if (!run || run.status !== 'paused') return;
+    tournamentRef.current = { ...run, status: 'running' };
+    setTournament(tournamentRef.current);
+    await launchTournamentGame(true);
+  };
+  const stopTournament = async (): Promise<void> => {
+    const run = tournamentRef.current;
+    if (run) {
+      tournamentRef.current = { ...run, status: 'stopped' };
+      setTournament(tournamentRef.current);
+    }
+    await stopEngines();
+    setNotice('TOURNAMENT STOPPED · Finished games remain in the local rating table.');
+  };
+  const switchMode = async (next: 'analysis' | 'arena') => {
+    if (tournamentRef.current?.status === 'running') await pauseTournament();
+    else await stopEngines();
+    modeRef.current = next;
+    setMode(next);
+  };
+
+  const addEngine = async (): Promise<void> => {
+    try {
+      const picked = await open({ multiple: false, directory: false,
+        filters: [{ name: 'UCI Chess Engine', extensions: ['exe'] }] });
+      if (typeof picked !== 'string') return;
+      const name = uniqueEngineName(enginesRef.current, fileName(picked).replace(/\.exe$/i, ''));
+      const created: EngineEntry = {
+        id: newEngineId(), name, path: picked, options: {}, availableOptions: []
+      };
+      enginesRef.current = [...enginesRef.current, created];
+      setEngines(enginesRef.current);
+      setNotice('ENGINE ADDED · ' + name + '. Open Engines to inspect its UCI options.');
+    } catch (error) { setNotice('ENGINE IMPORT FAILED · ' + String(error)); }
+  };
+  const removeEngine = (id: string) => {
+    if (tournamentRef.current?.status === 'running' || tournamentRef.current?.status === 'paused') {
+      setNotice('STOP THE TOURNAMENT before removing registered entrants.');
+      return;
+    }
+    if (id === BUILTIN_ID) return;
+    enginesRef.current = enginesRef.current.filter(x => x.id !== id);
+    setEngines(enginesRef.current);
+  };
+  const renameEngine = (id: string, name: string) => {
+    if (id === BUILTIN_ID) return;
+    enginesRef.current = enginesRef.current.map(e => e.id === id ? { ...e, name: name.slice(0, 80) } : e);
+    setEngines(enginesRef.current);
+  };
+  const editEngineOption = (id: string, name: string, value: string) => {
+    enginesRef.current = enginesRef.current.map(engine => engine.id === id ? {
+      ...engine, options: { ...engine.options, [name]: value.slice(0, 200) }
+    } : engine);
+    setEngines(enginesRef.current);
+  };
+  const inspectEngine = async (id: string): Promise<void> => {
+    const entry = enginesRef.current.find(engine => engine.id === id);
+    if (!entry || inspectingRef.current) return;
+    inspectingRef.current = id;
+    setInspectingId(id);
+    enginesRef.current = enginesRef.current.map(engine =>
+      engine.id === id ? { ...engine, availableOptions: [] } : engine);
+    setEngines(enginesRef.current);
+    setNotice('READING UCI OPTIONS · ' + entry.name);
+    try {
+      await invoke('launch_engine', { slot: 'inspect', path: entry.path });
+    } catch (error) {
+      inspectingRef.current = null;
+      setInspectingId(null);
+      setNotice('UCI INSPECTION FAILED · ' + String(error));
+    }
+  };
+  const assignEngine = (id: string, slot: Slot) => {
+    const entry = enginesRef.current.find(engine => engine.id === id);
+    if (!entry) return;
+    if (tournamentRef.current?.status === 'running') {
+      setNotice('PAUSE THE TOURNAMENT before assigning a new active engine.');
+      return;
+    }
+    if (liveRef.current) void stopEngines();
+    assignedRef.current = { ...assignedRef.current, [slot]: id };
+    pathsRef.current = { ...pathsRef.current, [slot]: entry.path };
+    namesRef.current = { ...namesRef.current, [slot]: entry.name };
+    setPaths(pathsRef.current);
+    setNames(namesRef.current);
+    setNotice(entry.name + ' assigned to ' + slot + '. Restart UCI analysis/match to apply.');
+  };
+
   const chooseEngine = async (slot: Slot) => {
     try {
       const picked = await open({ multiple: false, directory: false,
@@ -306,8 +562,19 @@ export default function App() {
       if (typeof picked !== 'string') return;
       if (liveRef.current) await stopEngines();
       setPaths(prev => ({ ...prev, [slot]: picked }));
-      setNames(prev => ({ ...prev, [slot]: fileName(picked) }));
-      namesRef.current = { ...namesRef.current, [slot]: fileName(picked) };
+      const same = enginesRef.current.find(entry => entry.path === picked);
+      const entry: EngineEntry = same || {
+        id: newEngineId(),
+        name: uniqueEngineName(enginesRef.current, fileName(picked).replace(/\.exe$/i, '')),
+        path: picked, options: {}, availableOptions: []
+      };
+      if (!same) {
+        enginesRef.current = [...enginesRef.current, entry];
+        setEngines(enginesRef.current);
+      }
+      assignedRef.current = { ...assignedRef.current, [slot]: entry.id };
+      setNames(prev => ({ ...prev, [slot]: entry.name }));
+      namesRef.current = { ...namesRef.current, [slot]: entry.name };
       setNotice('ENGINE SELECTED · ' + fileName(picked) + '. Restart analysis or arena.');
     } catch (error) { setNotice('FILE PICKER · ' + String(error)); }
   };
@@ -324,7 +591,7 @@ export default function App() {
     } catch (error) { setNotice('INVALID FEN · ' + String(error)); }
   };
   const manualMove = (from: string, to: string) => {
-    if (modeRef.current === 'arena' && liveRef.current) return;
+    if (modeRef.current !== 'analysis' && liveRef.current) return;
     if (commitMove(from, to)) {
       setPvs({ white: [], black: [] });
       setInfos({ white: undefined, black: undefined });
@@ -386,17 +653,28 @@ export default function App() {
     { label: 'LMR REDUCTIONS', value: shortNumber(xray?.lmrReductions) }
   ];
 
-  return <div className="app-root">
+  return <div className={'app-root' + (layout.boardFocus ? ' board-focus' : '')}
+    style={{
+      '--pv-width': 'min(' + layout.pvWidth + 'px, max(300px, calc(100vw - 820px)))',
+      '--board-max': layout.boardSize + 'px',
+      '--pv-mini': layout.pvBoardSize + 'px',
+      '--pv-font': layout.pvFontSize + 'px'
+    } as CSSProperties}>
     <header className="topbar">
+      <nav className="app-menubar" aria-label="Main application menu">
+        <button onClick={() => setControlTab('configure')}><SlidersHorizontal size={14}/> Configure</button>
+        <button onClick={() => setControlTab('tournament')}><Trophy size={14}/> Tournament</button>
+        <button onClick={() => setControlTab('engines')}><Cpu size={14}/> Engines</button>
+      </nav>
       <div className="brand"><div className="brand-mark"><Eye size={21} /></div>
         <div><b>CHESS<span>X-RAY</span></b><small>ENGINE OBSERVATORY</small></div></div>
       <nav className="topnav" aria-label="Application modes">
-        <button className={mode === 'analysis' ? 'nav-active' : ''} onClick={() => {
-          if (live) void stopEngines(); modeRef.current = 'analysis'; setMode('analysis');
-        }}><Activity size={16} /> Analysis</button>
-        <button className={mode === 'arena' ? 'nav-active' : ''} onClick={() => {
-          if (live) void stopEngines(); modeRef.current = 'arena'; setMode('arena');
-        }}><Swords size={16} /> Engine Arena</button>
+        <button className={mode === 'analysis' ? 'nav-active' : ''} onClick={() => void switchMode('analysis')}>
+          <Activity size={16} /> Analysis</button>
+        <button className={mode === 'arena' ? 'nav-active' : ''} onClick={() => void switchMode('arena')}>
+          <Swords size={16} /> Arena</button>
+        <button className={mode === 'tournament' ? 'nav-active' : ''} onClick={() => setControlTab('tournament')}>
+          <Trophy size={16} /> Event</button>
       </nav>
       <div className="top-actions"><span className="version-pill">v{appPackage.version}</span>
         <span className={'live-pill' + (live ? ' live' : '')}><i /> {live ? 'LIVE SESSION' : 'STANDBY'}</span></div>
@@ -412,11 +690,13 @@ export default function App() {
             <strong title={names[slot]}>{formatName(names[slot])}</strong>
             <div className="engine-path">{fileName(paths[slot])}</div>
             <div className="picker-actions">
-              <button onClick={() => void chooseEngine(slot)}><FolderOpen size={14} /> Browse .exe</button>
+              <button onClick={() => setControlTab('engines')}><Cpu size={14} /> Library</button>
+              <button title="Browse engine EXE" onClick={() => void chooseEngine(slot)}><FolderOpen size={14} /></button>
               <button title="Restore Stockfish 19" onClick={async () => {
                 if (liveRef.current) await stopEngines();
                 setPaths(prev => ({ ...prev, [slot]: '__bundled__' }));
                 setNames(prev => ({ ...prev, [slot]: ANCHOR_NAME }));
+                assignedRef.current = { ...assignedRef.current, [slot]: BUILTIN_ID };
                 namesRef.current = { ...namesRef.current, [slot]: ANCHOR_NAME };
               }}><RotateCcw size={14} /></button>
             </div>
@@ -434,7 +714,10 @@ export default function App() {
             <label>Hash (MB)<input type="number" value={hash} min="16" max="4096" onChange={e => setHash(Math.max(16, Math.min(4096, Number(e.target.value) || 16)))} disabled={live} /></label>
           </div>
           <div className="control-stack">
-            <button className="primary-action" onClick={() => void (mode === 'analysis' ? startAnalysis() : startArena())}><Play size={16} fill="currentColor" /> {mode === 'analysis' ? 'START ANALYSIS' : 'START MATCH'}</button>
+            <button className="primary-action" onClick={() => {
+              if (mode === 'tournament') setControlTab('tournament');
+              else void (mode === 'analysis' ? startAnalysis() : startArena());
+            }}><Play size={16} fill="currentColor" /> {mode === 'analysis' ? 'START ANALYSIS' : mode === 'arena' ? 'START MATCH' : 'TOURNAMENT CONTROL'}</button>
             <button className="secondary-action" onClick={() => void stopEngines()} disabled={!live}><Pause size={16} /> Stop engines</button>
           </div>
         </div>
@@ -461,21 +744,36 @@ export default function App() {
 
       <main className="main-content">
         <div className="content-title"><div><Banner>THE LIVE ENGINE LABORATORY</Banner>
-          <h1>{mode === 'analysis' ? 'Position analysis' : 'Engine championship'}<span className="text-lime">.</span></h1>
-          <p>{mode === 'analysis' ? 'Inspect principal variations, board geometry and real search activity.' : 'Run a local depth-limited UCI duel with a persistent rating table.'}</p></div>
+          <h1>{mode === 'analysis' ? 'Position analysis' : mode === 'tournament' ? 'Tournament broadcast' : 'Engine championship'}<span className="text-lime">.</span></h1>
+          <p>{mode === 'analysis' ? 'Inspect principal variations, board geometry and real search activity.' :
+            mode === 'tournament' ? 'Watch registered UCI engines compete in a scheduled event.' :
+            'Run a local depth-limited UCI duel with a persistent rating table.'}</p></div>
           <div className="title-actions">
             <button onClick={() => setFlipped(f => !f)}><ArrowLeftRight size={16} /> Flip board</button>
-            <button onClick={() => void resetGame()}><RotateCcw size={16} /> New game</button>
+            <button onClick={() => {
+              if (mode === 'tournament' && tournamentRef.current?.status === 'running') {
+                setControlTab('tournament');
+                return;
+              }
+              void resetGame();
+            }}><RotateCcw size={16} /> New game</button>
           </div></div>
 
         <div className="match-banner">
           <div className="player-title"><span className="player-color white" /> <div><b>{formatName(names.white)}</b><small>WHITE ENGINE</small></div></div>
           <div className="match-center"><span className="eyebrow">LIVE EVALUATION · WHITE POV</span>
-            <strong className="score-large">{scoreLabel(mode === 'arena' ? infos[chess.current.turn() === 'w' ? 'white' : 'black'] : infos.white, turn)}</strong>
+            <strong className="score-large">{scoreLabel(mode !== 'analysis' ? infos[chess.current.turn() === 'w' ? 'white' : 'black'] : infos.white, turn)}</strong>
             <span className="position-label">{chess.current.isCheck() ? 'CHECK' : 'POSITION EVALUATION'}</span></div>
           <div className="player-title right"><div><b>{formatName(names.black)}</b><small>BLACK ENGINE</small></div><span className="player-color black" /></div>
         </div>
 
+        <div className="board-size-strip"><span><SlidersHorizontal size={14}/> MAIN BOARD SIZE</span>
+          <input aria-label="Main board size" type="range" min="320" max="1100" step="10"
+            value={layout.boardSize} onChange={event => setLayout(prev => ({ ...prev, boardSize: Number(event.target.value) }))}/>
+          <output>{layout.boardSize}px</output>
+          {mode === 'tournament' && tournament && <span className="broadcast-round">
+            GAME {Math.min(tournament.index + 1, tournament.schedule.length)} / {tournament.schedule.length}</span>}
+        </div>
         <div className="board-and-insight">
           <div className="board-cluster">
             <div className="board-with-bar">
@@ -534,9 +832,30 @@ export default function App() {
       </main>
 
       <aside className="sidebar right-sidebar">
-        <section className="right-section">
+        <div className="pv-resize-handle" role="separator" aria-label="Drag to resize PV panel"
+          title="Drag left or right to resize PV panel"
+          onMouseDown={event => {
+            event.preventDefault();
+            const startX = event.clientX;
+            const startWidth = layout.pvWidth;
+            const move = (next: MouseEvent) => setLayout(current =>
+              ({ ...current, pvWidth: clamp(startWidth + startX - next.clientX, 280, 850) }));
+            const up = () => {
+              window.removeEventListener('mousemove', move);
+              window.removeEventListener('mouseup', up);
+            };
+            window.addEventListener('mousemove', move);
+            window.addEventListener('mouseup', up);
+          }}><span/></div>
+        <section className="right-section pv-primary-section">
+          <div className="pv-width-toolbar"><SlidersHorizontal size={13}/>
+            <label>PV panel</label>
+            <input aria-label="PV panel width" type="range" min="280" max="850" step="10"
+              value={layout.pvWidth} onChange={event => setLayout(prev => ({ ...prev, pvWidth: Number(event.target.value) }))}/>
+            <output>{layout.pvWidth}px</output>
+          </div>
           <div className="panel-heading"><div><Banner>PRINCIPAL VARIATIONS</Banner><h3><GitBranch size={18} /> Candidate moves</h3></div><span className="source-pill">MULTIPV {mode === 'analysis' ? multipv : 1}</span></div>
-          {mode === 'arena' && <div className="slot-selector"><button className={selectedSlot === 'white' ? 'selected' : ''} onClick={() => setSelectedSlot('white')}>WHITE PV</button>
+          {mode !== 'analysis' && <div className="slot-selector"><button className={selectedSlot === 'white' ? 'selected' : ''} onClick={() => setSelectedSlot('white')}>WHITE PV</button>
             <button className={selectedSlot === 'black' ? 'selected' : ''} onClick={() => setSelectedSlot('black')}>BLACK PV</button></div>}
           <div className="pv-list">
             {currentPvs.length === 0 && <div className="empty-state"><GitBranch size={36} /><b>Waiting for PV data</b><span>Start analysis to inspect the engine's search lines in real time.</span></div>}
@@ -569,6 +888,15 @@ export default function App() {
         </section>
       </aside>
     </div>
+    {controlTab && <ControlCenter
+      tab={controlTab} onTab={setControlTab} onClose={() => setControlTab(null)}
+      layout={layout} onLayout={setLayout} engines={engines}
+      onAddEngine={addEngine} onRemoveEngine={removeEngine} onRenameEngine={renameEngine}
+      onInspectEngine={inspectEngine} inspectingId={inspectingId}
+      onOption={editEngineOption} onAssign={assignEngine}
+      tournament={tournament} onStartTournament={startTournament}
+      onPauseTournament={pauseTournament} onResumeTournament={resumeTournament}
+      onStopTournament={stopTournament} />}
     <footer className="statusbar"><span><i className={'status-dot' + (live ? ' active' : '')} />{notice}</span>
       <div><span>RUST / TAURI 2</span><span className="footer-sep">/</span><span>UCI NATIVE</span><span className="footer-sep">/</span><span><Download size={12} /> OFFLINE STOCKFISH 19</span></div></footer>
   </div>;
